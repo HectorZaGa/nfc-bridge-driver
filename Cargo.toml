@@ -1,0 +1,24 @@
+[package]
+name = "nfc-bridge-driver"
+version = "0.1.0"
+edition = "2021"
+authors = ["Hector Zarate <HectorZaGa96@hotmail.com>"]
+description = "Ultra-low latency NFC bridge background driver and PC/SC emulator for Windows"
+
+[dependencies]
+tokio = { version = "1.41", features = ["full"] }
+bytes = "1.8"
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ctrlc = "3.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
