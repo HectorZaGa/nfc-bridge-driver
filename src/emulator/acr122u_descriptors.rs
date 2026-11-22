@@ -93,3 +93,49 @@ pub const ACR122U_CONFIG_DESCRIPTOR: &[u8] = &[
     0x08, 0x00, // wMaxPacketSize = 8 bytes
     0x20,       // bInterval = 32 ms
 ];
+
+/// String Descriptor 0: Supported Language Codes (0x0409 = English US)
+pub const STRING_DESCRIPTOR_LANGID: &[u8] = &[
+    0x04,       // bLength = 4
+    0x03,       // bDescriptorType = String (0x03)
+    0x09, 0x04, // wLANGID[0] = 0x0409 (en-US)
+];
+
+/// String Descriptor 1: Fabricante ("ACS")
+pub const STRING_DESCRIPTOR_MANUFACTURER: &[u8] = &[
+    0x08,       // bLength = 8
+    0x03,       // bDescriptorType = String (0x03)
+    b'A', 0x00, b'C', 0x00, b'S', 0x00,
+];
+
+/// String Descriptor 2: Producto ("ACR122U USB Reader")
+pub const STRING_DESCRIPTOR_PRODUCT: &[u8] = &[
+    0x26,       // bLength = 38 (2 + 18 * 2)
+    0x03,       // bDescriptorType = String (0x03)
+    b'A', 0x00, b'C', 0x00, b'R', 0x00, b'1', 0x00, b'2', 0x00, b'2', 0x00, b'U', 0x00,
+    b' ', 0x00, b'U', 0x00, b'S', 0x00, b'B', 0x00, b' ', 0x00, b'R', 0x00, b'e', 0x00,
+    b'a', 0x00, b'd', 0x00, b'e', 0x00, b'r', 0x00,
+];
+
+/// Busca y devuelve el descriptor solicitado por la PC en Endpoint 0.
+pub fn get_descriptor(desc_type: u8, desc_index: u8) -> Option<&'static [u8]> {
+    match desc_type {
+        0x01 => Some(ACR122U_DEVICE_DESCRIPTOR),
+        0x02 => Some(ACR122U_CONFIG_DESCRIPTOR),
+        0x03 => match desc_index {
+            0 => Some(STRING_DESCRIPTOR_LANGID),
+            1 => Some(STRING_DESCRIPTOR_MANUFACTURER),
+            2 => Some(STRING_DESCRIPTOR_PRODUCT),
+            _ => None,
+        },
+        0x21 => {
+            // Functional / CCID Class Descriptor (offset 18 en Config Descriptor)
+            if ACR122U_CONFIG_DESCRIPTOR.len() >= 18 + 54 {
+                Some(&ACR122U_CONFIG_DESCRIPTOR[18..18 + 54])
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
