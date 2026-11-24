@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, warn};
@@ -101,7 +101,20 @@ impl BridgeTcpServer {
             warn!("No se pudo configurar TCP_NODELAY: {}", e);
         }
 
-        let (mut reader, mut writer) = socket.into_split();
+        let (reader, writer) = socket.into_split();
+        self.handle_stream(reader, writer, peer_endpoint).await;
+    }
+
+    /// Maneja cualquier flujo bidireccional de tramas BAP v1 (TCP, USB AOA, etc.).
+    pub async fn handle_stream<R, W>(
+        &self,
+        mut reader: R,
+        mut writer: W,
+        peer_endpoint: String,
+    ) where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let (out_tx, mut out_rx) = mpsc::channel::<NfcBridgeFrame>(128);
 
         {
@@ -119,7 +132,11 @@ impl BridgeTcpServer {
             while let Some(frame) = out_rx.recv().await {
                 let encoded = FrameCodec::encode(&frame);
                 if let Err(e) = writer.write_all(&encoded).await {
-                    debug!("Error escribiendo en socket hacia móvil: {}", e);
+                    debug!("Error escribiendo hacia móvil: {}", e);
+                    break;
+                }
+                if let Err(e) = writer.flush().await {
+                    debug!("Error en flush hacia móvil: {}", e);
                     break;
                 }
             }
@@ -198,10 +215,12 @@ impl BridgeTcpServer {
         match frame.message_type {
             MessageType::HelloSyn => {
                 info!("Handshake HELLO_SYN recibido del móvil. Respondiendo HELLO_ACK...");
+                let pc_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "NFC Bridge PC".to_string());
+                let payload = format!(r#"{{"pc_name":"{}","status":"ready"}}"#, pc_name);
                 let ack_frame = NfcBridgeFrame::new(
                     MessageType::HelloAck,
                     frame.sequence_id,
-                    vec![0x00], // Status OK
+                    payload.into_bytes(),
                 );
                 let _ = out_tx.send(ack_frame).await;
             }

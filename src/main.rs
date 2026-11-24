@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 
 use nfc_bridge_driver::emulator::{CcidHandler, UsbIpServer, USBIP_DEFAULT_PORT};
 use nfc_bridge_driver::ipc::{IpcEvent, NamedPipeIpcServer};
-use nfc_bridge_driver::network::BridgeTcpServer;
+use nfc_bridge_driver::network::{BridgeTcpServer, UsbAoaHost};
 
 fn handle_cli_commands() -> Option<anyhow::Result<()>> {
     let args: Vec<String> = std::env::args().collect();
@@ -97,6 +97,12 @@ async fn main() -> anyhow::Result<()> {
         if let Err(e) = tcp_server_for_run.run().await {
             warn!("Servidor TCP directo no pudo enlazarse (nfc-bridge-sync puede estar gestionando la red): {}", e);
         }
+    });
+
+    // 3b. Iniciar Host USB AOA (Android Open Accessory puro sin ADB ni red)
+    let aoa_host = Arc::new(UsbAoaHost::new(Arc::clone(&tcp_server)));
+    tokio::spawn(async move {
+        aoa_host.run().await;
     });
 
     // 4. Iniciar Servidor USB/IP (Puerto 3240 para emulación USB CCID ACR122U)
