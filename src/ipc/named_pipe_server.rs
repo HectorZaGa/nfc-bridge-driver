@@ -7,15 +7,30 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use super::events::{IpcCommand, IpcEvent};
+use crate::network::BridgeTcpServer;
 use crate::protocol::constants::NAMED_PIPE_NAME;
 
 pub struct NamedPipeIpcServer {
     event_sender: broadcast::Sender<IpcEvent>,
+    coordinator: Option<Arc<BridgeTcpServer>>,
 }
 
 impl NamedPipeIpcServer {
     pub fn new(event_sender: broadcast::Sender<IpcEvent>) -> Self {
-        Self { event_sender }
+        Self {
+            event_sender,
+            coordinator: None,
+        }
+    }
+
+    pub fn with_coordinator(
+        event_sender: broadcast::Sender<IpcEvent>,
+        coordinator: Arc<BridgeTcpServer>,
+    ) -> Self {
+        Self {
+            event_sender,
+            coordinator: Some(coordinator),
+        }
     }
 
     /// Inicia el bucle que acepta clientes locales de Windows (Sync / Tools).
@@ -39,13 +54,12 @@ impl NamedPipeIpcServer {
                 }
             };
 
-            // Esperar a que un cliente local (Sync o Tools Desktop) se conecte
             if let Err(e) = server.connect().await {
                 warn!("Fallo al conectar cliente a Named Pipe: {}", e);
                 continue;
             }
 
-            info!("Cliente IPC conectado a Named Pipe");
+            info!("Cliente IPC (Sync / Tools) conectado a Named Pipe");
             let this = Arc::clone(&self);
             let mut event_rx = this.event_sender.subscribe();
 
@@ -53,25 +67,53 @@ impl NamedPipeIpcServer {
                 let (reader, mut writer) = tokio::io::split(server);
                 let mut lines = BufReader::new(reader).lines();
 
+                // Enviar estado inicial al conectarse Sync/Tools
+                if let Some(ref coord) = this.coordinator {
+                    let initial_status = coord.get_status_event().await;
+                    if let Ok(json) = serde_json::to_string(&initial_status) {
+                        let _ = writer.write_all(format!("{}\n", json).as_bytes()).await;
+                        let _ = writer.flush().await;
+                    }
+                }
+
                 loop {
                     tokio::select! {
-                        // Enviar eventos hacia el cliente
                         Ok(event) = event_rx.recv() => {
                             if let Ok(json) = serde_json::to_string(&event) {
                                 if writer.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
                                     break;
                                 }
+                                let _ = writer.flush().await;
                             }
                         }
-                        // Recibir comandos desde el cliente
                         line_result = lines.next_line() => {
                             match line_result {
                                 Ok(Some(line)) => {
                                     if let Ok(cmd) = serde_json::from_str::<IpcCommand>(&line) {
                                         info!("Comando IPC recibido: {:?}", cmd);
+                                        if let Some(ref coord) = this.coordinator {
+                                            match cmd {
+                                                IpcCommand::GetStatus => {
+                                                    let status = coord.get_status_event().await;
+                                                    if let Ok(json) = serde_json::to_string(&status) {
+                                                        if writer.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
+                                                            break;
+                                                        }
+                                                        let _ = writer.flush().await;
+                                                    }
+                                                }
+                                                IpcCommand::SetPaused { paused } => {
+                                                    coord.set_paused(paused).await;
+                                                }
+                                                IpcCommand::DisconnectDevice => {
+                                                    coord.disconnect_active().await;
+                                                }
+                                                IpcCommand::SetUsbPriority { .. } => {}
+                                            }
+                                        }
                                     }
                                 }
-                                _ => break, // Cliente desconectado
+                                _ => break,
                             }
                         }
                     }

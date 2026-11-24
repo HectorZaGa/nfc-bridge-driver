@@ -82,30 +82,33 @@ async fn main() -> anyhow::Result<()> {
     // Canal broadcast interno para eventos IPC (Sync / Tools Desktop)
     let (event_tx, _) = broadcast::channel::<IpcEvent>(128);
 
-    // 2. Iniciar Servidor IPC (Named Pipe de Windows: \\.\pipe\nfc_bridge_driver)
-    let ipc_server = Arc::new(NamedPipeIpcServer::new(event_tx.clone()));
+    // 2. Instanciar coordinador de red/transporte (TCP + UDP Discovery + USB AOA)
+    let tcp_server = Arc::new(BridgeTcpServer::new(event_tx.clone(), Arc::clone(&ccid_handler)));
+
+    // 3. Iniciar Servidor IPC (Named Pipe de Windows: \\.\pipe\nfc_bridge_driver)
+    let ipc_server = Arc::new(NamedPipeIpcServer::with_coordinator(
+        event_tx,
+        Arc::clone(&tcp_server),
+    ));
     tokio::spawn(async move {
         ipc_server.run().await;
     });
 
-    // 3. Iniciar Servidor TCP (Puerto 45362)
-    // Si nfc-bridge-sync ya está escuchando en 45362, no detener el driver:
-    // en ese escenario, nfc-bridge-sync actuará como puente vía Named Pipe.
-    let tcp_server = Arc::new(BridgeTcpServer::new(event_tx, Arc::clone(&ccid_handler)));
+    // 4. Iniciar Servidor TCP + Responder UDP Discovery (Puerto 45362)
     let tcp_server_for_run = Arc::clone(&tcp_server);
     tokio::spawn(async move {
         if let Err(e) = tcp_server_for_run.run().await {
-            warn!("Servidor TCP directo no pudo enlazarse (nfc-bridge-sync puede estar gestionando la red): {}", e);
+            tracing::error!("Error crítico al iniciar servidor TCP/UDP del driver en 45362: {}", e);
         }
     });
 
-    // 3b. Iniciar Host USB AOA (Android Open Accessory puro sin ADB ni red)
+    // 5. Iniciar Host USB AOA (Android Open Accessory puro sin ADB ni red)
     let aoa_host = Arc::new(UsbAoaHost::new(Arc::clone(&tcp_server)));
     tokio::spawn(async move {
         aoa_host.run().await;
     });
 
-    // 4. Iniciar Servidor USB/IP (Puerto 3240 para emulación USB CCID ACR122U)
+    // 6. Iniciar Servidor USB/IP (Puerto 3240 para emulación USB CCID ACR122U)
     let usbip_server = UsbIpServer::new(USBIP_DEFAULT_PORT, Arc::clone(&ccid_handler));
     let tcp_server_for_usbip = Arc::clone(&tcp_server);
     tokio::spawn(async move {

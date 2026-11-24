@@ -1,19 +1,37 @@
-//! Servidor TCP de ultra baja latencia para comunicación con NFC Bridge Android.
+//! Servidor TCP / UDP Discovery de ultra baja latencia para comunicación con NFC Bridge Android.
+//!
+//! Es el núcleo de transporte en Windows: gestiona las conexiones entrantes (TCP, USB AOA, etc.),
+//! responde al auto-descubrimiento UDP en la red local y sincroniza el estado en vivo hacia
+//! el lector virtual CCID y las aplicaciones de escritorio vía IPC Named Pipe.
 
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
 use crate::emulator::CcidHandler;
 use crate::ipc::events::IpcEvent;
 use crate::protocol::codec::{FrameCodec, StreamFrameDecoder};
 use crate::protocol::constants::DEFAULT_TCP_PORT;
+use crate::protocol::crc::compute_crc16;
 use crate::protocol::frame::NfcBridgeFrame;
 use crate::protocol::message_type::MessageType;
+
+#[derive(Debug, Clone, Default)]
+pub struct DriverRuntimeStatus {
+    pub connected: bool,
+    pub device_name: Option<String>,
+    pub endpoint: Option<String>,
+    pub latency_ms: u64,
+    pub paused: bool,
+    pub tag_present: bool,
+    pub tag_uid: Option<String>,
+}
 
 pub struct BridgeTcpServer {
     event_tx: broadcast::Sender<IpcEvent>,
@@ -21,6 +39,9 @@ pub struct BridgeTcpServer {
     sequence_counter: AtomicU16,
     active_client_tx: Arc<Mutex<Option<mpsc::Sender<NfcBridgeFrame>>>>,
     pending_transceive: Arc<Mutex<Option<(u16, oneshot::Sender<Vec<u8>>)>>>,
+    runtime_status: Arc<Mutex<DriverRuntimeStatus>>,
+    is_paused: AtomicBool,
+    disconnect_notify: Arc<Notify>,
 }
 
 impl BridgeTcpServer {
@@ -31,19 +52,64 @@ impl BridgeTcpServer {
             sequence_counter: AtomicU16::new(1),
             active_client_tx: Arc::new(Mutex::new(None)),
             pending_transceive: Arc::new(Mutex::new(None)),
+            runtime_status: Arc::new(Mutex::new(DriverRuntimeStatus::default())),
+            is_paused: AtomicBool::new(false),
+            disconnect_notify: Arc::new(Notify::new()),
         }
     }
 
-    /// Inicia el listener TCP en el puerto 45362.
+    pub async fn get_status_event(&self) -> IpcEvent {
+        let st = self.runtime_status.lock().await;
+        IpcEvent::Status {
+            connected: st.connected,
+            device_name: st.device_name.clone(),
+            latency_ms: st.latency_ms,
+            paused: self.is_paused.load(Ordering::Relaxed),
+            tag_present: st.tag_present,
+            tag_uid: st.tag_uid.clone(),
+        }
+    }
+
+    pub async fn set_paused(&self, paused: bool) {
+        self.is_paused.store(paused, Ordering::Relaxed);
+        {
+            let mut st = self.runtime_status.lock().await;
+            st.paused = paused;
+            if paused {
+                st.tag_present = false;
+                st.tag_uid = None;
+            }
+        }
+        if paused {
+            let mut handler = self.ccid_handler.lock().await;
+            handler.set_tag(None);
+        }
+        let status_evt = self.get_status_event().await;
+        let _ = self.event_tx.send(status_evt);
+    }
+
+    pub async fn disconnect_active(&self) {
+        self.disconnect_notify.notify_waiters();
+    }
+
+    /// Inicia el listener TCP y el responder UDP de auto-descubrimiento en el puerto 45362.
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         let addr = format!("0.0.0.0:{}", DEFAULT_TCP_PORT);
         let listener = TcpListener::bind(&addr).await?;
-        info!("Servidor TCP escuchando en {} (Esperando teléfono Android)", addr);
+        info!("Driver TCP escuchando en {} (Esperando teléfono Android)", addr);
+
+        // Iniciar responder UDP en el mismo puerto 45362 para auto-descubrimiento en red Wi-Fi / LAN
+        let pc_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "NFC Bridge PC".to_string());
+        tokio::spawn(async move {
+            if let Err(e) = Self::run_udp_discovery_responder(DEFAULT_TCP_PORT, pc_name).await {
+                warn!("UDP discovery responder en driver finalizó con error: {}", e);
+            }
+        });
 
         loop {
             match listener.accept().await {
                 Ok((socket, peer_addr)) => {
-                    info!("Dispositivo Android conectado desde: {}", peer_addr);
+                    info!("Dispositivo Android conectado vía TCP desde: {}", peer_addr);
                     let server = Arc::clone(&self);
                     tokio::spawn(async move {
                         server.handle_client(socket, peer_addr.to_string()).await;
@@ -56,8 +122,57 @@ impl BridgeTcpServer {
         }
     }
 
+    async fn run_udp_discovery_responder(port: u16, pc_name: String) -> anyhow::Result<()> {
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        let socket = UdpSocket::bind(addr).await?;
+        info!("Driver UDP auto-descubrimiento activo en {}", addr);
+
+        let mut buf = [0u8; 1024];
+        let mut last_logged: HashMap<String, Instant> = HashMap::new();
+
+        loop {
+            match socket.recv_from(&mut buf).await {
+                Ok((len, peer_addr)) => {
+                    let msg = String::from_utf8_lossy(&buf[..len]);
+                    if msg.contains("NFC_BRIDGE_DISCOVERY") {
+                        let pc_id = format!(
+                            "{:04X}{:04X}",
+                            compute_crc16(pc_name.as_bytes()),
+                            compute_crc16(&port.to_le_bytes())
+                        );
+                        let response = format!(
+                            r#"{{"id":"{}","name":"{}","port":{},"model":"WINDOWS","status":"ready"}}"#,
+                            pc_id, pc_name, port
+                        );
+                        if let Err(e) = socket.send_to(response.as_bytes(), peer_addr).await {
+                            warn!("Error respondiendo descubrimiento UDP a {}: {}", peer_addr, e);
+                        } else {
+                            let peer_ip = peer_addr.ip().to_string();
+                            let now = Instant::now();
+                            let should_log = last_logged
+                                .get(&peer_ip)
+                                .map(|prev| now.duration_since(*prev) >= Duration::from_secs(3))
+                                .unwrap_or(true);
+                            if should_log {
+                                last_logged.insert(peer_ip, now);
+                                info!("Descubrimiento Wi-Fi respondido a {} (PC: '{}')", peer_addr, pc_name);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Error recibiendo datagrama UDP: {}", e);
+                }
+            }
+        }
+    }
+
     /// Envía un comando transceive crudo / APDU al teléfono Android conectado y espera la respuesta.
     pub async fn transceive(&self, payload: Vec<u8>) -> Option<Vec<u8>> {
+        if self.is_paused.load(Ordering::Relaxed) {
+            return None;
+        }
+
         let client_tx = {
             let guard = self.active_client_tx.lock().await;
             guard.clone()
@@ -79,7 +194,6 @@ impl BridgeTcpServer {
             return None;
         }
 
-        // Timeout de 2 segundos para la respuesta del transceive NFC
         match tokio::time::timeout(Duration::from_secs(2), resp_rx).await {
             Ok(Ok(response_bytes)) => Some(response_bytes),
             Ok(Err(_)) => {
@@ -96,7 +210,6 @@ impl BridgeTcpServer {
     }
 
     async fn handle_client(&self, socket: TcpStream, peer_endpoint: String) {
-        // Desactivar algoritmo de Nagle para latencia sub-milisegundo (<1ms)
         if let Err(e) = socket.set_nodelay(true) {
             warn!("No se pudo configurar TCP_NODELAY: {}", e);
         }
@@ -105,7 +218,7 @@ impl BridgeTcpServer {
         self.handle_stream(reader, writer, peer_endpoint).await;
     }
 
-    /// Maneja cualquier flujo bidireccional de tramas BAP v1 (TCP, USB AOA, etc.).
+    /// Maneja cualquier flujo bidireccional de tramas BAP v1 (TCP, USB AOA, Bluetooth, etc.).
     pub async fn handle_stream<R, W>(
         &self,
         mut reader: R,
@@ -121,13 +234,18 @@ impl BridgeTcpServer {
             let mut active = self.active_client_tx.lock().await;
             *active = Some(out_tx.clone());
         }
+        {
+            let mut st = self.runtime_status.lock().await;
+            st.connected = true;
+            st.device_name = Some("Android Phone".to_string());
+            st.endpoint = Some(peer_endpoint.clone());
+        }
 
         let _ = self.event_tx.send(IpcEvent::DeviceConnected {
             device_name: "Android Phone".to_string(),
             endpoint: peer_endpoint.clone(),
         });
 
-        // Bucle de escritura asíncrono
         let write_task = tokio::spawn(async move {
             while let Some(frame) = out_rx.recv().await {
                 let encoded = FrameCodec::encode(&frame);
@@ -142,10 +260,10 @@ impl BridgeTcpServer {
             }
         });
 
-        // Tarea periódica de Heartbeat para monitorear latencia RTT (<5ms)
         let hb_tx = out_tx.clone();
         let hb_event_tx = self.event_tx.clone();
-        let hb_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hb_status = Arc::clone(&self.runtime_status);
+        let hb_active = Arc::new(AtomicBool::new(true));
         let hb_flag = Arc::clone(&hb_active);
 
         let heartbeat_task = tokio::spawn(async move {
@@ -157,9 +275,12 @@ impl BridgeTcpServer {
 
                 if hb_tx.send(ping_frame).await.is_ok() {
                     let rtt_ms = start_time.elapsed().as_millis() as u64;
-                    let _ = hb_event_tx.send(IpcEvent::LatencyUpdated {
-                        latency_ms: rtt_ms.max(1),
-                    });
+                    let latency = rtt_ms.max(1);
+                    {
+                        let mut st = hb_status.lock().await;
+                        st.latency_ms = latency;
+                    }
+                    let _ = hb_event_tx.send(IpcEvent::LatencyUpdated { latency_ms: latency });
                 } else {
                     break;
                 }
@@ -169,27 +290,33 @@ impl BridgeTcpServer {
         let mut decoder = StreamFrameDecoder::new();
         let mut buffer = [0u8; 4096];
 
-        // Bucle de lectura de paquetes entrantes
         loop {
-            match reader.read(&mut buffer).await {
-                Ok(0) => {
-                    info!("Dispositivo Android desconectado ({})", peer_endpoint);
+            tokio::select! {
+                _ = self.disconnect_notify.notified() => {
+                    info!("Desconexión solicitada vía IPC para {}", peer_endpoint);
                     break;
                 }
-                Ok(n) => {
-                    let frames = decoder.feed(&buffer[..n]);
-                    for frame in frames {
-                        self.process_frame(frame, &out_tx).await;
+                read_res = reader.read(&mut buffer) => {
+                    match read_res {
+                        Ok(0) => {
+                            info!("Dispositivo Android desconectado ({})", peer_endpoint);
+                            break;
+                        }
+                        Ok(n) => {
+                            let frames = decoder.feed(&buffer[..n]);
+                            for frame in frames {
+                                self.process_frame(frame, &out_tx).await;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Error de lectura en enlace con móvil ({}): {}", peer_endpoint, e);
+                            break;
+                        }
                     }
-                }
-                Err(e) => {
-                    warn!("Error de lectura en socket TCP: {}", e);
-                    break;
                 }
             }
         }
 
-        // Limpieza de estado al desconectar el móvil
         hb_active.store(false, Ordering::Relaxed);
         heartbeat_task.abort();
         write_task.abort();
@@ -198,7 +325,14 @@ impl BridgeTcpServer {
             let mut active = self.active_client_tx.lock().await;
             *active = None;
         }
-
+        {
+            let mut st = self.runtime_status.lock().await;
+            st.connected = false;
+            st.device_name = None;
+            st.endpoint = None;
+            st.tag_present = false;
+            st.tag_uid = None;
+        }
         {
             let mut handler = self.ccid_handler.lock().await;
             handler.set_tag(None);
@@ -225,12 +359,19 @@ impl BridgeTcpServer {
                 let _ = out_tx.send(ack_frame).await;
             }
             MessageType::TagAttached => {
+                if self.is_paused.load(Ordering::Relaxed) {
+                    return;
+                }
                 if let Some(tag) = FrameCodec::decode_tag_attached(&frame.payload) {
                     let uid_hex = tag.uid_hex();
                     let is_ntag215 = tag.is_mifare_ultralight();
                     info!("ETIQUETA NFC DETECTADA: UID={} (NTAG215={})", uid_hex, is_ntag215);
 
-                    // Actualizar el manejador CCID para que emuladores PC detecten la tarjeta de inmediato
+                    {
+                        let mut st = self.runtime_status.lock().await;
+                        st.tag_present = true;
+                        st.tag_uid = Some(uid_hex.clone());
+                    }
                     {
                         let mut handler = self.ccid_handler.lock().await;
                         handler.set_tag(Some(tag.clone()));
@@ -251,6 +392,11 @@ impl BridgeTcpServer {
             MessageType::TagDetached => {
                 info!("ETIQUETA NFC RETIRADA del campo");
                 {
+                    let mut st = self.runtime_status.lock().await;
+                    st.tag_present = false;
+                    st.tag_uid = None;
+                }
+                {
                     let mut handler = self.ccid_handler.lock().await;
                     handler.set_tag(None);
                 }
@@ -268,13 +414,10 @@ impl BridgeTcpServer {
                 }
             }
             MessageType::Heartbeat => {
-                // Móvil envía heartbeat, responder con ACK inmediato
                 let ack = NfcBridgeFrame::new(MessageType::HeartbeatAck, frame.sequence_id, vec![]);
                 let _ = out_tx.send(ack).await;
             }
-            MessageType::HeartbeatAck => {
-                // RTT procesado
-            }
+            MessageType::HeartbeatAck => {}
             _ => {
                 info!("Trama recibida: tipo={:?}, seq={}", frame.message_type, frame.sequence_id);
             }
