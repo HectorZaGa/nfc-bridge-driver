@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "command", content = "params")]
 pub enum IpcCommand {
     GetStatus,
+    GetWifiDirectInfo,
     SetPaused { paused: bool },
     SetUsbPriority { enabled: bool },
     DisconnectDevice,
@@ -23,6 +24,16 @@ pub enum IpcEvent {
         paused: bool,
         tag_present: bool,
         tag_uid: Option<String>,
+    },
+    WifiDirectStatus {
+        available: bool,
+        active: bool,
+        pc_name: String,
+        ssid: Option<String>,
+        passphrase: Option<String>,
+        ip: Option<String>,
+        port: u16,
+        reason: Option<String>,
     },
     DeviceConnected {
         device_name: String,

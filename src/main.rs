@@ -13,7 +13,9 @@ use tracing_subscriber::EnvFilter;
 
 use nfc_bridge_driver::emulator::{CcidHandler, UsbIpServer, USBIP_DEFAULT_PORT};
 use nfc_bridge_driver::ipc::{IpcEvent, NamedPipeIpcServer};
-use nfc_bridge_driver::network::{BluetoothRfcommServer, BridgeTcpServer, UsbAoaHost};
+use nfc_bridge_driver::network::{
+    BluetoothRfcommServer, BridgeTcpServer, UsbAoaHost, WifiDirectServer,
+};
 
 fn run_hidden_command(program: &str, args: &[&str]) -> std::io::Result<std::process::ExitStatus> {
     let mut cmd = std::process::Command::new(program);
@@ -171,11 +173,13 @@ async fn run_driver(shutdown: Option<Arc<Notify>>, log_to_file: bool) -> anyhow:
 
     // 2. Instanciar coordinador de red/transporte (TCP + UDP Discovery + USB AOA)
     let tcp_server = Arc::new(BridgeTcpServer::new(event_tx.clone(), Arc::clone(&ccid_handler)));
+    let wfd_server = Arc::new(WifiDirectServer::new(event_tx.clone()));
 
     // 3. Iniciar Servidor IPC (Named Pipe de Windows: \\.\pipe\nfc_bridge_driver)
-    let ipc_server = Arc::new(NamedPipeIpcServer::with_coordinator(
+    let ipc_server = Arc::new(NamedPipeIpcServer::with_transports(
         event_tx,
         Arc::clone(&tcp_server),
+        Arc::clone(&wfd_server),
     ));
     tokio::spawn(async move {
         ipc_server.run().await;
@@ -199,6 +203,12 @@ async fn run_driver(shutdown: Option<Arc<Notify>>, log_to_file: bool) -> anyhow:
     let bt_server = Arc::new(BluetoothRfcommServer::new(Arc::clone(&tcp_server)));
     tokio::spawn(async move {
         bt_server.run().await;
+    });
+
+    // 7. Iniciar Servidor Wi-Fi Direct (P2P nativo + Legacy SoftAP automático)
+    let wfd_server_for_run = Arc::clone(&wfd_server);
+    tokio::spawn(async move {
+        wfd_server_for_run.run().await;
     });
 
     // 6. Iniciar Servidor USB/IP (Puerto 3240 para emulación USB CCID ACR122U)

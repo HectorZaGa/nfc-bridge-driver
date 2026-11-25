@@ -7,12 +7,13 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use super::events::{IpcCommand, IpcEvent};
-use crate::network::BridgeTcpServer;
+use crate::network::{BridgeTcpServer, WifiDirectServer};
 use crate::protocol::constants::NAMED_PIPE_NAME;
 
 pub struct NamedPipeIpcServer {
     event_sender: broadcast::Sender<IpcEvent>,
     coordinator: Option<Arc<BridgeTcpServer>>,
+    wifi_direct: Option<Arc<WifiDirectServer>>,
 }
 
 #[cfg(windows)]
@@ -72,6 +73,7 @@ impl NamedPipeIpcServer {
         Self {
             event_sender,
             coordinator: None,
+            wifi_direct: None,
         }
     }
 
@@ -82,6 +84,19 @@ impl NamedPipeIpcServer {
         Self {
             event_sender,
             coordinator: Some(coordinator),
+            wifi_direct: None,
+        }
+    }
+
+    pub fn with_transports(
+        event_sender: broadcast::Sender<IpcEvent>,
+        coordinator: Arc<BridgeTcpServer>,
+        wifi_direct: Arc<WifiDirectServer>,
+    ) -> Self {
+        Self {
+            event_sender,
+            coordinator: Some(coordinator),
+            wifi_direct: Some(wifi_direct),
         }
     }
 
@@ -124,6 +139,13 @@ impl NamedPipeIpcServer {
                         let _ = writer.flush().await;
                     }
                 }
+                if let Some(ref wfd) = this.wifi_direct {
+                    let initial_wfd = wfd.get_status_event();
+                    if let Ok(json) = serde_json::to_string(&initial_wfd) {
+                        let _ = writer.write_all(format!("{}\n", json).as_bytes()).await;
+                        let _ = writer.flush().await;
+                    }
+                }
 
                 loop {
                     tokio::select! {
@@ -140,24 +162,39 @@ impl NamedPipeIpcServer {
                                 Ok(Some(line)) => {
                                     if let Ok(cmd) = serde_json::from_str::<IpcCommand>(&line) {
                                         info!("Comando IPC recibido: {:?}", cmd);
-                                        if let Some(ref coord) = this.coordinator {
-                                            match cmd {
-                                                IpcCommand::GetStatus => {
-                                                    let status = coord.get_status_event().await;
-                                                    if let Ok(json) = serde_json::to_string(&status) {
+                                        match cmd {
+                                            IpcCommand::GetWifiDirectInfo => {
+                                                if let Some(ref wfd) = this.wifi_direct {
+                                                    let wfd_evt = wfd.get_status_event();
+                                                    if let Ok(json) = serde_json::to_string(&wfd_evt) {
                                                         if writer.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
                                                             break;
                                                         }
                                                         let _ = writer.flush().await;
                                                     }
                                                 }
-                                                IpcCommand::SetPaused { paused } => {
-                                                    coord.set_paused(paused).await;
+                                            }
+                                            other_cmd => {
+                                                if let Some(ref coord) = this.coordinator {
+                                                    match other_cmd {
+                                                        IpcCommand::GetStatus => {
+                                                            let status = coord.get_status_event().await;
+                                                            if let Ok(json) = serde_json::to_string(&status) {
+                                                                if writer.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
+                                                                    break;
+                                                                }
+                                                                let _ = writer.flush().await;
+                                                            }
+                                                        }
+                                                        IpcCommand::SetPaused { paused } => {
+                                                            coord.set_paused(paused).await;
+                                                        }
+                                                        IpcCommand::DisconnectDevice => {
+                                                            coord.disconnect_active().await;
+                                                        }
+                                                        IpcCommand::SetUsbPriority { .. } | IpcCommand::GetWifiDirectInfo => {}
+                                                    }
                                                 }
-                                                IpcCommand::DisconnectDevice => {
-                                                    coord.disconnect_active().await;
-                                                }
-                                                IpcCommand::SetUsbPriority { .. } => {}
                                             }
                                         }
                                     }
