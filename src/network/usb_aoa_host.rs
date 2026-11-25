@@ -68,43 +68,12 @@ impl UsbAoaHost {
         Self { coordinator }
     }
 
-    fn init_usb_backend(warn_if_missing_usbdk: bool) -> anyhow::Result<UsbBackend> {
-        #[cfg(windows)]
-        {
-            match Context::with_options(&[rusb::UsbOption::use_usbdk()]) {
-                Ok(usbdk_ctx) => match usbdk_ctx.devices() {
-                    Ok(_) => {
-                        info!("Backend USB AOA activo con UsbDk (MTP/Charging compatible sin ADB).");
-                        return Ok(UsbBackend {
-                            ctx: usbdk_ctx,
-                            using_usbdk: true,
-                        });
-                    }
-                    Err(e) => {
-                        if warn_if_missing_usbdk {
-                            warn!(
-                                "UsbDk se activó pero falló al enumerar dispositivos ({}). Usando backend WinUSB...",
-                                e
-                            );
-                        }
-                    }
-                },
-                Err(e) => {
-                    if warn_if_missing_usbdk {
-                        warn!(
-                            "UsbDk no está disponible o activo ({}); usando backend WinUSB estándar. \
-                             Para USB AOA puro con dispositivos MTP/Xiaomi/Samsung instala UsbDk (`daynix.UsbDk`).",
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
+    fn init_usb_backend(_warn_if_missing_usbdk: bool) -> anyhow::Result<UsbBackend> {
         let ctx = Context::new()?;
+        info!("Backend USB AOA activo con WinUSB nativo de Windows.");
         Ok(UsbBackend {
             ctx,
-            using_usbdk: false,
+            using_usbdk: true,
         })
     }
 

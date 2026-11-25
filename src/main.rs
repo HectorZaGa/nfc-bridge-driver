@@ -15,9 +15,6 @@ use nfc_bridge_driver::emulator::{CcidHandler, UsbIpServer, USBIP_DEFAULT_PORT};
 use nfc_bridge_driver::ipc::{IpcEvent, NamedPipeIpcServer};
 use nfc_bridge_driver::network::{BridgeTcpServer, UsbAoaHost};
 
-#[cfg(all(windows, target_arch = "x86_64"))]
-const EMBEDDED_USBDK_MSI: &[u8] = include_bytes!("../assets/UsbDk_1.0.22_x64.msi");
-
 fn run_hidden_command(program: &str, args: &[&str]) -> std::io::Result<std::process::ExitStatus> {
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
@@ -28,48 +25,6 @@ fn run_hidden_command(program: &str, args: &[&str]) -> std::io::Result<std::proc
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd.status()
-}
-
-fn is_usbdk_installed() -> bool {
-    run_hidden_command("sc.exe", &["query", "UsbDk"])
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn install_embedded_usbdk(quiet: bool) -> anyhow::Result<()> {
-    if is_usbdk_installed() {
-        return Ok(());
-    }
-
-    #[cfg(all(windows, target_arch = "x86_64"))]
-    {
-        let temp_msi = std::env::temp_dir().join(format!(
-            "nfc-bridge-usbdk-{}.msi",
-            std::process::id()
-        ));
-        std::fs::write(&temp_msi, EMBEDDED_USBDK_MSI)?;
-
-        let mode_arg = if quiet { "/qn" } else { "/passive" };
-        let temp_str = temp_msi.to_string_lossy().to_string();
-        let status = std::process::Command::new("msiexec.exe")
-            .args(["/i", &temp_str, mode_arg, "/norestart"])
-            .status();
-
-        let _ = std::fs::remove_file(&temp_msi);
-
-        let status = status?;
-        let code = status.code().unwrap_or(-1);
-        if status.success() || code == 3010 {
-            return Ok(());
-        }
-        anyhow::bail!("Instalación de UsbDk falló con código msiexec: {}", code);
-    }
-
-    #[cfg(not(all(windows, target_arch = "x86_64")))]
-    {
-        let _ = quiet;
-        anyhow::bail!("UsbDk embebido solo disponible para arquitectura Windows x64");
-    }
 }
 
 fn handle_cli_commands() -> Option<anyhow::Result<()>> {
@@ -93,10 +48,6 @@ fn handle_cli_commands() -> Option<anyhow::Result<()>> {
             }
         }
         "--install-service" => {
-            if let Err(e) = install_embedded_usbdk(true) {
-                return Some(Err(anyhow::anyhow!("No se pudo instalar UsbDk embebido: {}", e)));
-            }
-
             let exe_path = std::env::current_exe().unwrap_or_default();
             let bin_path = format!("\"{}\" --service", exe_path.to_string_lossy());
             let bin_arg = format!("binPath={}", bin_path);
@@ -150,7 +101,6 @@ fn handle_cli_commands() -> Option<anyhow::Result<()>> {
                 Err(e) => Some(Err(anyhow::anyhow!("No se pudo ejecutar sc.exe: {}", e))),
             }
         }
-        "--install-usbdk" => Some(install_embedded_usbdk(false)),
         "--uninstall-service" => {
             let _ = run_hidden_command("sc.exe", &["stop", "NfcBridgeDriver"]);
             let status = run_hidden_command("sc.exe", &["delete", "NfcBridgeDriver"]);
