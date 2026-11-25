@@ -30,6 +30,63 @@ fn run_hidden_command(program: &str, args: &[&str]) -> std::io::Result<std::proc
     cmd.status()
 }
 
+fn configure_firewall_rules(enable: bool) {
+    let rule_tcp = "NFC Bridge Driver (TCP 45362)";
+    let rule_udp = "NFC Bridge Driver (UDP Discovery 45362)";
+    let _ = run_hidden_command(
+        "netsh",
+        &[
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("name={}", rule_tcp),
+        ],
+    );
+    let _ = run_hidden_command(
+        "netsh",
+        &[
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("name={}", rule_udp),
+        ],
+    );
+    if enable {
+        let _ = run_hidden_command(
+            "netsh",
+            &[
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &format!("name={}", rule_tcp),
+                "dir=in",
+                "action=allow",
+                "protocol=TCP",
+                "localport=45362",
+                "profile=any",
+            ],
+        );
+        let _ = run_hidden_command(
+            "netsh",
+            &[
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &format!("name={}", rule_udp),
+                "dir=in",
+                "action=allow",
+                "protocol=UDP",
+                "localport=45362",
+                "profile=any",
+            ],
+        );
+    }
+}
+
 fn replace_previous_driver_processes() -> Result<usize, usize> {
     #[cfg(windows)]
     {
@@ -165,6 +222,7 @@ fn handle_cli_commands() -> Option<anyhow::Result<()>> {
 
             match status {
                 Ok(s) if s.success() => {
+                    configure_firewall_rules(true);
                     let start_status = run_hidden_command("sc.exe", &["start", "NfcBridgeDriver"]);
                     match start_status {
                         Ok(st) if st.success() => Some(Ok(())),
@@ -187,6 +245,7 @@ fn handle_cli_commands() -> Option<anyhow::Result<()>> {
             let _ = run_hidden_command("sc.exe", &["stop", "NfcBridgeDriver"]);
             std::thread::sleep(std::time::Duration::from_millis(400));
             let _ = replace_previous_driver_processes();
+            configure_firewall_rules(false);
             let status = run_hidden_command("sc.exe", &["delete", "NfcBridgeDriver"]);
             match status {
                 Ok(s) if s.success() => Some(Ok(())),

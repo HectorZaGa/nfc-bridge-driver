@@ -7,6 +7,12 @@ pub struct TrustedDeviceInfo {
     pub device_id: String,
     pub device_name: String,
     pub created_unix: u64,
+    #[serde(default)]
+    pub mobile_id: Option<String>,
+    #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -30,6 +36,7 @@ pub enum IpcCommand {
     SetBluetoothEnabled { enabled: bool },
     DisconnectDevice,
     RevokeTrustedDevice { device_id: String },
+    RenameTrustedDevice { device_id: String, name: String },
 }
 
 /// Eventos emitidos en tiempo real por el Driver hacia las aplicaciones de escritorio.
@@ -43,6 +50,12 @@ pub enum IpcEvent {
         paused: bool,
         tag_present: bool,
         tag_uid: Option<String>,
+        #[serde(default)]
+        transport: Option<String>,
+        #[serde(default)]
+        mobile_id: Option<String>,
+        #[serde(default)]
+        active_device_id: Option<String>,
     },
     WifiDirectStatus {
         available: bool,

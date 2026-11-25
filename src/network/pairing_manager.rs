@@ -10,14 +10,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
 use crate::ipc::events::TrustedDeviceInfo;
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use ring::digest;
 
-const DEFAULT_PAIR_TTL_SECS: u64 = 300;
+const QR_PAIR_TTL_SECS: u64 = 30;
+const RELAY_LINK_TTL_SECS: u64 = 90;
+const RELAY_ENVELOPE_DOMAIN: &[u8] = b"NFC-BRIDGE-RELAY-LINK-ENVELOPE-V1|v1|2026";
+const RELAY_ENVELOPE_AAD: &[u8] = b"nb-link-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustedDevice {
     pub device_token: String,
     pub device_name: String,
     pub created_unix: u64,
+    #[serde(default)]
+    pub mobile_id: Option<String>,
+    #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub custom_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -30,11 +43,23 @@ struct HelloSynPayload {
     #[serde(default)]
     device_name: Option<String>,
     #[serde(default)]
+    mobile_id: Option<String>,
+    #[serde(default)]
+    transport: Option<String>,
+    #[serde(default)]
     pair_token: Option<String>,
     #[serde(default)]
     device_token: Option<String>,
     #[serde(default)]
     paused: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HelloAuthResult {
+    pub outcome: HelloAuthOutcome,
+    pub device_id: Option<String>,
+    pub mobile_id: Option<String>,
+    pub transport: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,8 +174,17 @@ impl PairingManager {
         normalized
     }
 
-    /// Emite un token temporal único de un solo uso (válido por 90 segundos).
+    /// Emite un token temporal único de un solo uso según el método (`30s` QR, `90s` Enlace remoto).
     pub fn issue_ephemeral_token(&self) -> (String, u64) {
+        self.issue_ephemeral_token_for_method("qr")
+    }
+
+    pub fn issue_ephemeral_token_for_method(&self, method: &str) -> (String, u64) {
+        let ttl_secs = if method == "relay_link" {
+            RELAY_LINK_TTL_SECS
+        } else {
+            QR_PAIR_TTL_SECS
+        };
         let now = Instant::now();
         let token = generate_random_hex_token("PAIR", 8);
         if let Ok(mut map) = self.ephemeral_tokens.lock() {
@@ -158,11 +192,11 @@ impl PairingManager {
             map.insert(
                 token.clone(),
                 EphemeralEntry {
-                    expires_at: now + Duration::from_secs(DEFAULT_PAIR_TTL_SECS),
+                    expires_at: now + Duration::from_secs(ttl_secs),
                 },
             );
         }
-        (token, DEFAULT_PAIR_TTL_SECS)
+        (token, ttl_secs)
     }
 
     /// Valida el payload de `HELLO_SYN`. Si recibe un `pair_token` vigente, lo consume y genera
@@ -176,23 +210,56 @@ impl PairingManager {
         payload: &[u8],
         require_token: bool,
     ) -> HelloAuthOutcome {
+        self.validate_hello_payload_with_meta(payload, require_token, "tcp", "")
+            .outcome
+    }
+
+    pub fn validate_hello_payload_with_meta(
+        &self,
+        payload: &[u8],
+        require_token: bool,
+        fallback_transport: &str,
+        endpoint: &str,
+    ) -> HelloAuthResult {
+        let default_transport = normalize_transport_name(fallback_transport);
+        let endpoint_opt = {
+            let trimmed = endpoint.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
+
         if payload.is_empty() {
-            return if require_token {
+            let outcome = if require_token {
                 HelloAuthOutcome::Rejected {
                     reason: "token_required".to_string(),
                 }
             } else {
                 HelloAuthOutcome::LegacyAllowed { device_name: None }
             };
+            return HelloAuthResult {
+                outcome,
+                device_id: None,
+                mobile_id: None,
+                transport: default_transport,
+            };
         }
 
         let Ok(parsed) = serde_json::from_slice::<HelloSynPayload>(payload) else {
-            return if require_token {
+            let outcome = if require_token {
                 HelloAuthOutcome::Rejected {
                     reason: "invalid_hello_payload".to_string(),
                 }
             } else {
                 HelloAuthOutcome::LegacyAllowed { device_name: None }
+            };
+            return HelloAuthResult {
+                outcome,
+                device_id: None,
+                mobile_id: None,
+                transport: default_transport,
             };
         };
 
@@ -200,6 +267,16 @@ impl PairingManager {
             .device_name
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let mobile_id = parsed
+            .mobile_id
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let transport = parsed
+            .transport
+            .as_deref()
+            .map(normalize_transport_name)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default_transport);
 
         if let Some(pair_tok) = parsed
             .pair_token
@@ -216,20 +293,23 @@ impl PairingManager {
             };
 
             if valid {
-                let permanent = generate_random_hex_token("DEV", 32);
                 let device_label = clean_name.clone().unwrap_or_else(|| "Android Phone".to_string());
-                let record = TrustedDevice {
-                    device_token: permanent.clone(),
-                    device_name: device_label,
-                    created_unix: unix_now_secs(),
-                };
-                if let Ok(mut list) = self.trusted_devices.lock() {
-                    list.push(record);
-                    save_trusted_devices(&self.data_dir.join("trusted_devices.json"), &list);
-                }
-                return HelloAuthOutcome::Paired {
-                    device_name: clean_name,
-                    new_device_token: permanent,
+                let (permanent, effective_name) = self.upsert_trusted_device(
+                    &device_label,
+                    mobile_id.clone(),
+                    Some(transport.clone()),
+                    endpoint_opt,
+                    None,
+                );
+                let device_id = Some(device_public_id(&permanent));
+                return HelloAuthResult {
+                    outcome: HelloAuthOutcome::Paired {
+                        device_name: Some(effective_name),
+                        new_device_token: permanent,
+                    },
+                    device_id,
+                    mobile_id,
+                    transport,
                 };
             }
 
@@ -240,16 +320,32 @@ impl PairingManager {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                 {
-                    if self.check_trusted_device_token(dev_tok, clean_name.as_ref()) {
-                        return HelloAuthOutcome::Trusted {
-                            device_name: clean_name,
+                    if let Some((effective_name, device_id)) = self.match_trusted_device_token(
+                        dev_tok,
+                        clean_name.as_ref(),
+                        mobile_id.as_ref(),
+                        Some(&transport),
+                        endpoint_opt.as_deref(),
+                    ) {
+                        return HelloAuthResult {
+                            outcome: HelloAuthOutcome::Trusted {
+                                device_name: Some(effective_name),
+                            },
+                            device_id: Some(device_id),
+                            mobile_id,
+                            transport,
                         };
                     }
                 }
             }
 
-            return HelloAuthOutcome::Rejected {
-                reason: "pair_token_expired".to_string(),
+            return HelloAuthResult {
+                outcome: HelloAuthOutcome::Rejected {
+                    reason: "pair_token_expired".to_string(),
+                },
+                device_id: None,
+                mobile_id,
+                transport,
             };
         }
 
@@ -259,23 +355,67 @@ impl PairingManager {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            if self.check_trusted_device_token(dev_tok, clean_name.as_ref()) {
-                return HelloAuthOutcome::Trusted {
-                    device_name: clean_name,
+            if let Some((effective_name, device_id)) = self.match_trusted_device_token(
+                dev_tok,
+                clean_name.as_ref(),
+                mobile_id.as_ref(),
+                Some(&transport),
+                endpoint_opt.as_deref(),
+            ) {
+                return HelloAuthResult {
+                    outcome: HelloAuthOutcome::Trusted {
+                        device_name: Some(effective_name),
+                    },
+                    device_id: Some(device_id),
+                    mobile_id,
+                    transport,
                 };
             }
-            return HelloAuthOutcome::Rejected {
-                reason: "device_token_unknown".to_string(),
+            return HelloAuthResult {
+                outcome: HelloAuthOutcome::Rejected {
+                    reason: "device_token_unknown".to_string(),
+                },
+                device_id: None,
+                mobile_id,
+                transport,
             };
         }
 
         if require_token {
-            HelloAuthOutcome::Rejected {
-                reason: "token_required".to_string(),
+            HelloAuthResult {
+                outcome: HelloAuthOutcome::Rejected {
+                    reason: "token_required".to_string(),
+                },
+                device_id: None,
+                mobile_id,
+                transport,
+            }
+        } else if let Some(ref label) = clean_name {
+            let (permanent, effective_name) = self.upsert_trusted_device(
+                label,
+                mobile_id.clone(),
+                Some(transport.clone()),
+                endpoint_opt,
+                None,
+            );
+            let device_id = Some(device_public_id(&permanent));
+            HelloAuthResult {
+                outcome: HelloAuthOutcome::Paired {
+                    device_name: Some(effective_name),
+                    new_device_token: permanent,
+                },
+                device_id,
+                mobile_id,
+                transport,
             }
         } else {
-            HelloAuthOutcome::LegacyAllowed {
-                device_name: clean_name,
+            HelloAuthResult {
+                outcome: HelloAuthOutcome::LegacyAllowed {
+                    device_name: clean_name,
+                },
+                device_id: None,
+                mobile_id,
+                transport,
             }
         }
     }
@@ -287,35 +427,167 @@ impl PairingManager {
         list.iter()
             .map(|d| TrustedDeviceInfo {
                 device_id: device_public_id(&d.device_token),
-                device_name: d.device_name.clone(),
+                device_name: d
+                    .custom_name
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(&d.device_name)
+                    .to_string(),
                 created_unix: d.created_unix,
+                mobile_id: d.mobile_id.clone(),
+                transport: d.transport.clone(),
+                endpoint: d.endpoint.clone(),
             })
             .collect()
     }
 
-    fn check_trusted_device_token(&self, dev_tok: &str, clean_name: Option<&String>) -> bool {
+    pub fn rename_trusted_device(&self, device_id: &str, new_name: &str) -> Option<String> {
+        let clean = new_name.trim();
+        if clean.is_empty() {
+            return None;
+        }
+        let mut list = self.trusted_devices.lock().ok()?;
+        let found = list
+            .iter_mut()
+            .find(|d| device_public_id(&d.device_token) == device_id)?;
+        found.custom_name = Some(clean.to_string());
+        let final_name = clean.to_string();
+        save_trusted_devices(&self.data_dir.join("trusted_devices.json"), &list);
+        Some(final_name)
+    }
+
+    fn upsert_trusted_device(
+        &self,
+        device_label: &str,
+        mobile_id: Option<String>,
+        transport: Option<String>,
+        endpoint: Option<String>,
+        preferred_token: Option<String>,
+    ) -> (String, String) {
+        let path = self.data_dir.join("trusted_devices.json");
+        let permanent = preferred_token.unwrap_or_else(|| generate_random_hex_token("DEV", 32));
+        let Ok(mut list) = self.trusted_devices.lock() else {
+            return (permanent, device_label.to_string());
+        };
+
+        let existing_idx = list.iter().position(|d| {
+            let same_transport = match (&d.transport, &transport) {
+                (Some(a), Some(b)) => a == b,
+                (None, _) => true,
+                _ => false,
+            };
+            if !same_transport {
+                return false;
+            }
+            if let (Some(mid_a), Some(mid_b)) = (&d.mobile_id, &mobile_id) {
+                return mid_a.eq_ignore_ascii_case(mid_b);
+            }
+            d.device_name == device_label && (d.mobile_id.is_none() || mobile_id.is_none())
+        });
+
+        let effective_name = if let Some(idx) = existing_idx {
+            let existing = &mut list[idx];
+            existing.device_token = permanent.clone();
+            existing.device_name = device_label.to_string();
+            existing.created_unix = unix_now_secs();
+            if mobile_id.is_some() {
+                existing.mobile_id = mobile_id;
+            }
+            if transport.is_some() {
+                existing.transport = transport;
+            }
+            if endpoint.is_some() {
+                existing.endpoint = endpoint;
+            }
+            existing
+                .custom_name
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(&existing.device_name)
+                .to_string()
+        } else {
+            list.push(TrustedDevice {
+                device_token: permanent.clone(),
+                device_name: device_label.to_string(),
+                created_unix: unix_now_secs(),
+                mobile_id,
+                transport,
+                endpoint,
+                custom_name: None,
+            });
+            device_label.to_string()
+        };
+
+        save_trusted_devices(&path, &list);
+        (permanent, effective_name)
+    }
+
+    fn match_trusted_device_token(
+        &self,
+        dev_tok: &str,
+        clean_name: Option<&String>,
+        mobile_id: Option<&String>,
+        transport: Option<&str>,
+        endpoint: Option<&str>,
+    ) -> Option<(String, String)> {
         let path = self.data_dir.join("trusted_devices.json");
         let Ok(mut list) = self.trusted_devices.lock() else {
-            return false;
+            return None;
         };
-        if let Some(found) = list
-            .iter_mut()
-            .find(|d| bool::from(d.device_token.as_bytes().ct_eq(dev_tok.as_bytes())))
+
+        if list
+            .iter()
+            .all(|d| !bool::from(d.device_token.as_bytes().ct_eq(dev_tok.as_bytes())))
         {
-            if let Some(name) = clean_name {
-                if found.device_name != *name {
-                    found.device_name = name.clone();
-                    save_trusted_devices(&path, &list);
-                }
+            let disk = load_trusted_devices(&path);
+            if disk
+                .iter()
+                .any(|d| bool::from(d.device_token.as_bytes().ct_eq(dev_tok.as_bytes())))
+            {
+                *list = disk;
             }
-            return true;
         }
-        let disk = load_trusted_devices(&path);
-        if disk.iter().any(|d| bool::from(d.device_token.as_bytes().ct_eq(dev_tok.as_bytes()))) {
-            *list = disk;
-            return true;
+
+        let found = list
+            .iter_mut()
+            .find(|d| bool::from(d.device_token.as_bytes().ct_eq(dev_tok.as_bytes())))?;
+
+        let mut dirty = false;
+        if let Some(name) = clean_name {
+            if found.device_name != *name {
+                found.device_name = name.clone();
+                dirty = true;
+            }
         }
-        false
+        if let Some(mid) = mobile_id {
+            if found.mobile_id.as_deref() != Some(mid.as_str()) {
+                found.mobile_id = Some(mid.clone());
+                dirty = true;
+            }
+        }
+        if let Some(tr) = transport {
+            if found.transport.as_deref() != Some(tr) {
+                found.transport = Some(tr.to_string());
+                dirty = true;
+            }
+        }
+        if let Some(ep) = endpoint {
+            if found.endpoint.as_deref() != Some(ep) {
+                found.endpoint = Some(ep.to_string());
+                dirty = true;
+            }
+        }
+        let display_name = found
+            .custom_name
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&found.device_name)
+            .to_string();
+        let dev_id = device_public_id(&found.device_token);
+        if dirty {
+            save_trusted_devices(&path, &list);
+        }
+        Some((display_name, dev_id))
     }
 
     pub fn revoke_trusted_device(&self, device_id: &str) -> Option<String> {
@@ -371,21 +643,15 @@ impl PairingManager {
                 );
                 (uri, None)
             }
-            "relay" => {
+            "relay" | "relay_link" => {
                 let channel = self.get_relay_channel();
                 let base = self.get_relay_url().unwrap_or_default();
                 let ws_base = to_ws_base(&base);
                 let http_base = to_http_base(&base);
-                let query = format!(
-                    "channel={}&name={}&transport=relay&relay={}&pair={}",
-                    percent_encode_query(&channel),
-                    encoded_name,
-                    percent_encode_query(&ws_base),
-                    percent_encode_query(pair_token),
-                );
-                let uri = format!("nfcbridge://relay?{}", query);
+                let envelope = encrypt_relay_envelope(&channel, &self.pc_name, &ws_base, pair_token);
+                let uri = format!("nfcbridge://relay?d={}", percent_encode_query(&envelope));
                 let share = if !http_base.is_empty() {
-                    Some(format!("{}/connect?{}", http_base, query))
+                    Some(format!("{}/connect?d={}", http_base, percent_encode_query(&envelope)))
                 } else {
                     None
                 };
@@ -457,6 +723,148 @@ pub fn to_http_base(raw: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn normalize_transport_name(raw: &str) -> String {
+    let lower = raw.trim().to_lowercase();
+    if lower.contains("usb") {
+        "usb".to_string()
+    } else if lower.contains("bluetooth") || lower == "bt" {
+        "bluetooth".to_string()
+    } else if lower.contains("relay") {
+        "relay".to_string()
+    } else if lower.contains("wifi_direct") || lower.contains("wifi-direct") || lower.contains("p2p") {
+        "wifi_direct".to_string()
+    } else {
+        "tcp".to_string()
+    }
+}
+
+fn relay_envelope_key() -> LessSafeKey {
+    let key_hash = digest::digest(&digest::SHA256, RELAY_ENVELOPE_DOMAIN);
+    let unbound = UnboundKey::new(&AES_256_GCM, key_hash.as_ref()).expect("valid AES-256 key");
+    LessSafeKey::new(unbound)
+}
+
+pub fn encrypt_relay_envelope(
+    channel: &str,
+    pc_name: &str,
+    relay_ws: &str,
+    pair_token: &str,
+) -> String {
+    let json = serde_json::json!({
+        "c": channel,
+        "n": pc_name,
+        "r": relay_ws,
+        "p": pair_token,
+    })
+    .to_string();
+
+    let mut nonce_bytes = [0u8; 12];
+    if getrandom::getrandom(&mut nonce_bytes).is_err() {
+        let nanos = unix_now_secs() ^ (std::process::id() as u64);
+        nonce_bytes[..8].copy_from_slice(&nanos.to_le_bytes());
+    }
+
+    let key = relay_envelope_key();
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+    let mut buffer = json.into_bytes();
+    let _ = key.seal_in_place_append_tag(nonce, Aad::from(RELAY_ENVELOPE_AAD), &mut buffer);
+
+    let mut combined = Vec::with_capacity(12 + buffer.len());
+    combined.extend_from_slice(&nonce_bytes);
+    combined.extend_from_slice(&buffer);
+    format!("v1.{}", base64url_encode_nopad(&combined))
+}
+
+#[cfg(test)]
+fn decrypt_relay_envelope(encoded: &str) -> Option<(String, String, String, String)> {
+    let body = encoded.strip_prefix("v1.")?;
+    let raw = base64url_decode_nopad(body)?;
+    if raw.len() <= 12 {
+        return None;
+    }
+    let (nonce_slice, cipher_slice) = raw.split_at(12);
+    let nonce_arr: [u8; 12] = nonce_slice.try_into().ok()?;
+    let key = relay_envelope_key();
+    let mut buf = cipher_slice.to_vec();
+    let plain = key
+        .open_in_place(
+            Nonce::assume_unique_for_key(nonce_arr),
+            Aad::from(RELAY_ENVELOPE_AAD),
+            &mut buf,
+        )
+        .ok()?;
+    #[derive(Deserialize)]
+    struct EnvelopeJson {
+        c: String,
+        n: String,
+        r: String,
+        p: String,
+    }
+    let parsed: EnvelopeJson = serde_json::from_slice(plain).ok()?;
+    Some((parsed.c, parsed.n, parsed.r, parsed.p))
+}
+
+fn base64url_encode_nopad(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity((data.len() * 4 + 2) / 3);
+    let mut i = 0;
+    while i < data.len() {
+        let b0 = data[i] as u32;
+        let b1 = if i + 1 < data.len() { data[i + 1] as u32 } else { 0 };
+        let b2 = if i + 2 < data.len() { data[i + 2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if i + 1 < data.len() {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        }
+        if i + 2 < data.len() {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        }
+        i += 3;
+    }
+    out
+}
+
+#[cfg(test)]
+fn base64url_decode_nopad(s: &str) -> Option<Vec<u8>> {
+    fn val(b: u8) -> Option<u32> {
+        match b {
+            b'A'..=b'Z' => Some((b - b'A') as u32),
+            b'a'..=b'z' => Some((b - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((b - b'0' + 52) as u32),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    let mut i = 0;
+    while i < bytes.len() {
+        let c0 = val(*bytes.get(i)?)?;
+        let c1 = val(*bytes.get(i + 1)?)?;
+        let c2 = match bytes.get(i + 2).copied() {
+            Some(b) => Some(val(b)?),
+            None => None,
+        };
+        let c3 = match bytes.get(i + 3).copied() {
+            Some(b) => Some(val(b)?),
+            None => None,
+        };
+        let triple = (c0 << 18) | (c1 << 12) | (c2.unwrap_or(0) << 6) | c3.unwrap_or(0);
+        out.push(((triple >> 16) & 0xFF) as u8);
+        if c2.is_some() {
+            out.push(((triple >> 8) & 0xFF) as u8);
+        }
+        if c3.is_some() {
+            out.push((triple & 0xFF) as u8);
+        }
+        i += 4;
+    }
+    Some(out)
 }
 
 fn percent_encode_query(raw: &str) -> String {
@@ -618,7 +1026,9 @@ mod tests {
         let dir = temp_dir("pair_once");
         let mgr = PairingManager::with_data_dir(dir.clone(), "HECTOR-MASTER".to_string());
         let (pair_token, ttl) = mgr.issue_ephemeral_token();
-        assert_eq!(ttl, 300);
+        assert_eq!(ttl, 30);
+        let (_, link_ttl) = mgr.issue_ephemeral_token_for_method("relay_link");
+        assert_eq!(link_ttl, 90);
 
         let syn1 = format!(r#"{{"device_name":"Morduuk","pair_token":"{}"}}"#, pair_token);
         let outcome1 = mgr.validate_hello_payload(syn1.as_bytes());
@@ -666,11 +1076,21 @@ mod tests {
             None,
             None,
         );
-        assert!(uri.starts_with("nfcbridge://relay?channel=nb-"));
-        assert!(uri.contains("relay=wss%3A%2F%2Fnfc-relay.example.workers.dev"));
-        assert!(uri.contains("pair=PAIR-1234"));
+        assert!(uri.starts_with("nfcbridge://relay?d=v1."));
+        assert!(!uri.contains("channel="));
+        assert!(!uri.contains("PAIR-1234"));
         let link = share.expect("share link expected when relay URL set");
-        assert!(link.starts_with("https://nfc-relay.example.workers.dev/connect?"));
+        assert!(link.starts_with("https://nfc-relay.example.workers.dev/connect?d=v1."));
+        assert!(!link.contains("channel="));
+        assert!(!link.contains("PAIR-1234"));
+
+        let d_enc = uri.strip_prefix("nfcbridge://relay?d=").unwrap();
+        let d_raw = d_enc.replace("%2D", "-").replace("%5F", "_").replace("%2E", ".");
+        let (c, n, r, p) = decrypt_relay_envelope(&d_raw).expect("decrypt envelope");
+        assert!(c.starts_with("nb-"));
+        assert_eq!(n, "PC ONE");
+        assert_eq!(r, "wss://nfc-relay.example.workers.dev");
+        assert_eq!(p, "PAIR-1234");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

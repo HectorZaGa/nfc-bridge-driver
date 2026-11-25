@@ -29,6 +29,9 @@ pub struct DriverRuntimeStatus {
     pub connected: bool,
     pub device_name: Option<String>,
     pub endpoint: Option<String>,
+    pub transport: Option<String>,
+    pub mobile_id: Option<String>,
+    pub active_device_id: Option<String>,
     pub latency_ms: u64,
     pub paused: bool,
     pub tag_present: bool,
@@ -209,6 +212,22 @@ impl BridgeTcpServer {
         false
     }
 
+    pub async fn update_active_device_name(&self, device_id: &str, new_name: &str) {
+        let updated = {
+            let mut st = self.runtime_status.lock().await;
+            if st.connected && st.active_device_id.as_deref() == Some(device_id) {
+                st.device_name = Some(new_name.to_string());
+                true
+            } else {
+                false
+            }
+        };
+        if updated {
+            let evt = self.get_status_event().await;
+            let _ = self.event_tx.send(evt);
+        }
+    }
+
     pub async fn get_status_event(&self) -> IpcEvent {
         let st = self.runtime_status.lock().await;
         IpcEvent::Status {
@@ -218,6 +237,9 @@ impl BridgeTcpServer {
             paused: self.is_paused.load(Ordering::Relaxed),
             tag_present: st.tag_present,
             tag_uid: st.tag_uid.clone(),
+            transport: st.transport.clone(),
+            mobile_id: st.mobile_id.clone(),
+            active_device_id: st.active_device_id.clone(),
         }
     }
 
@@ -570,6 +592,9 @@ impl BridgeTcpServer {
                 st.connected = false;
                 st.device_name = None;
                 st.endpoint = None;
+                st.transport = None;
+                st.mobile_id = None;
+                st.active_device_id = None;
                 st.paused = false;
                 st.tag_present = false;
                 st.tag_uid = None;
@@ -598,10 +623,14 @@ impl BridgeTcpServer {
             MessageType::HelloSyn => {
                 let pc_name = self.pairing.pc_name().to_string();
                 let phone_paused = parse_hello_paused(&frame.payload);
-                let outcome = self
-                    .pairing
-                    .validate_hello_payload_for_transport(&frame.payload, require_token);
-                match outcome {
+                let fallback_tr = infer_transport_from_endpoint(peer_endpoint, &self.wfd_host_ip);
+                let auth_res = self.pairing.validate_hello_payload_with_meta(
+                    &frame.payload,
+                    require_token,
+                    &fallback_tr,
+                    peer_endpoint,
+                );
+                match auth_res.outcome {
                     HelloAuthOutcome::Rejected { reason } => {
                         warn!("Handshake HELLO_SYN rechazado ({})", reason);
                         let payload = serde_json::json!({
@@ -627,10 +656,13 @@ impl BridgeTcpServer {
                         device_name,
                         new_device_token,
                     } => {
-                        info!("Handshake HELLO_SYN emparejado con QR/Link (nuevo device_token emitido)");
+                        info!("Handshake HELLO_SYN emparejado (nuevo device_token emitido)");
                         self.accept_hello_session(
                             device_name,
                             Some(new_device_token),
+                            Some(auth_res.transport),
+                            auth_res.mobile_id,
+                            auth_res.device_id,
                             phone_paused,
                             &pc_name,
                             peer_endpoint,
@@ -646,6 +678,9 @@ impl BridgeTcpServer {
                         self.accept_hello_session(
                             device_name,
                             None,
+                            Some(auth_res.transport),
+                            auth_res.mobile_id,
+                            auth_res.device_id,
                             phone_paused,
                             &pc_name,
                             peer_endpoint,
@@ -755,6 +790,9 @@ impl BridgeTcpServer {
         &self,
         device_name: Option<String>,
         new_device_token: Option<String>,
+        transport: Option<String>,
+        mobile_id: Option<String>,
+        active_device_id: Option<String>,
         phone_paused: bool,
         pc_name: &str,
         peer_endpoint: &str,
@@ -769,6 +807,9 @@ impl BridgeTcpServer {
             st.connected = true;
             st.device_name = Some(name.clone());
             st.endpoint = Some(peer_endpoint.to_string());
+            st.transport = transport;
+            st.mobile_id = mobile_id;
+            st.active_device_id = active_device_id;
         }
         self.apply_pause_state(phone_paused).await;
         let _ = self.event_tx.send(IpcEvent::DeviceConnected {
@@ -801,6 +842,20 @@ impl BridgeTcpServer {
             hint_payload.into_bytes(),
         );
         let _ = out_tx.send(hint_frame).await;
+    }
+}
+
+fn infer_transport_from_endpoint(endpoint: &str, wfd_host_ip: &StdMutex<Option<String>>) -> String {
+    if endpoint.starts_with("USB-AOA") {
+        "usb".to_string()
+    } else if endpoint.starts_with("Bluetooth") {
+        "bluetooth".to_string()
+    } else if endpoint == "Cloud Relay" {
+        "relay".to_string()
+    } else if is_wfd_endpoint_str(endpoint, wfd_host_ip) {
+        "wifi_direct".to_string()
+    } else {
+        "tcp".to_string()
     }
 }
 

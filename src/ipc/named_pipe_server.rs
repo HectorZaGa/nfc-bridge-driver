@@ -329,7 +329,8 @@ impl NamedPipeIpcServer {
                                                 }
 
                                                 if let Some(ref pairing) = this.pairing {
-                                                    let (pair_token, expires_in_secs) = pairing.issue_ephemeral_token();
+                                                    let (pair_token, expires_in_secs) =
+                                                        pairing.issue_ephemeral_token_for_method(&method);
                                                     let bt_info = get_local_bluetooth_info();
                                                     let wfd = this.wifi_direct.as_ref().map(|w| w.current_snapshot());
                                                     let tcp_ip = detect_lan_ipv4();
@@ -448,14 +449,31 @@ impl NamedPipeIpcServer {
                                                     if let Some(ref coord) = this.coordinator {
                                                         if let IpcEvent::Status {
                                                             connected: true,
-                                                            device_name: Some(active_name),
+                                                            device_name: active_name,
+                                                            active_device_id,
                                                             ..
                                                         } = coord.get_status_event().await
                                                         {
-                                                            if active_name == removed_name {
+                                                            if active_device_id.as_deref() == Some(device_id.as_str())
+                                                                || active_name.as_deref() == Some(removed_name.as_str())
+                                                            {
                                                                 coord.disconnect_active().await;
                                                             }
                                                         }
+                                                    }
+                                                }
+                                                if let Some(snapshot) = this.build_transport_snapshot() {
+                                                    let _ = this.event_sender.send(snapshot);
+                                                }
+                                            }
+                                            IpcCommand::RenameTrustedDevice { device_id, name } => {
+                                                if let Some(clean_name) = this
+                                                    .pairing
+                                                    .as_ref()
+                                                    .and_then(|p| p.rename_trusted_device(&device_id, &name))
+                                                {
+                                                    if let Some(ref coord) = this.coordinator {
+                                                        coord.update_active_device_name(&device_id, &clean_name).await;
                                                     }
                                                 }
                                                 if let Some(snapshot) = this.build_transport_snapshot() {
@@ -489,7 +507,8 @@ impl NamedPipeIpcServer {
                                                         | IpcCommand::GetTransportSnapshot
                                                         | IpcCommand::IssuePairingToken { .. }
                                                         | IpcCommand::SetRelayUrl { .. }
-                                                        | IpcCommand::RevokeTrustedDevice { .. } => {}
+                                                        | IpcCommand::RevokeTrustedDevice { .. }
+                                                        | IpcCommand::RenameTrustedDevice { .. } => {}
                                                     }
                                                 }
                                             }

@@ -148,6 +148,11 @@ export default {
 
 function buildDeepLink(url) {
   const relayWs = `wss://${url.host}`;
+  const encrypted = (url.searchParams.get("d") || "").trim();
+  if (encrypted) {
+    return `nfcbridge://relay?d=${encodeURIComponent(encrypted)}&relay=${encodeURIComponent(relayWs)}`;
+  }
+
   const out = new URLSearchParams();
   const channel = (url.searchParams.get("channel") || "").trim();
   const name = (url.searchParams.get("name") || "PC Windows").trim().slice(0, 64);
