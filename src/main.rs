@@ -159,11 +159,32 @@ fn init_logging(to_programdata_file: bool) {
         .try_init();
 }
 
+fn is_another_driver_instance_active() -> bool {
+    #[cfg(windows)]
+    {
+        use std::fs::OpenOptions;
+        let pipe = nfc_bridge_driver::protocol::constants::NAMED_PIPE_NAME;
+        match OpenOptions::new().read(true).write(true).open(pipe) {
+            Ok(_) => true,
+            Err(e) => e.raw_os_error() == Some(231),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 async fn run_driver(shutdown: Option<Arc<Notify>>, log_to_file: bool) -> anyhow::Result<()> {
     init_logging(log_to_file);
     std::panic::set_hook(Box::new(|panic_info| {
         tracing::error!("PANIC crítico en NFC Bridge Driver: {}", panic_info);
     }));
+
+    if is_another_driver_instance_active() {
+        warn!("Ya existe otra instancia activa de NFC Bridge Driver en el sistema; cerrando duplicado.");
+        return Ok(());
+    }
 
     info!("============================================================");
     info!(

@@ -215,26 +215,41 @@ impl PairingManager {
                 false
             };
 
-            if !valid {
-                return HelloAuthOutcome::Rejected {
-                    reason: "pair_token_expired".to_string(),
+            if valid {
+                let permanent = generate_random_hex_token("DEV", 32);
+                let device_label = clean_name.clone().unwrap_or_else(|| "Android Phone".to_string());
+                let record = TrustedDevice {
+                    device_token: permanent.clone(),
+                    device_name: device_label,
+                    created_unix: unix_now_secs(),
+                };
+                if let Ok(mut list) = self.trusted_devices.lock() {
+                    list.push(record);
+                    save_trusted_devices(&self.data_dir.join("trusted_devices.json"), &list);
+                }
+                return HelloAuthOutcome::Paired {
+                    device_name: clean_name,
+                    new_device_token: permanent,
                 };
             }
 
-            let permanent = generate_random_hex_token("DEV", 32);
-            let device_label = clean_name.clone().unwrap_or_else(|| "Android Phone".to_string());
-            let record = TrustedDevice {
-                device_token: permanent.clone(),
-                device_name: device_label,
-                created_unix: unix_now_secs(),
-            };
-            if let Ok(mut list) = self.trusted_devices.lock() {
-                list.push(record);
-                save_trusted_devices(&self.data_dir.join("trusted_devices.json"), &list);
+            if !require_token {
+                if let Some(dev_tok) = parsed
+                    .device_token
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if self.check_trusted_device_token(dev_tok, clean_name.as_ref()) {
+                        return HelloAuthOutcome::Trusted {
+                            device_name: clean_name,
+                        };
+                    }
+                }
             }
-            return HelloAuthOutcome::Paired {
-                device_name: clean_name,
-                new_device_token: permanent,
+
+            return HelloAuthOutcome::Rejected {
+                reason: "pair_token_expired".to_string(),
             };
         }
 
@@ -244,24 +259,10 @@ impl PairingManager {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            if let Ok(mut list) = self.trusted_devices.lock() {
-                if let Some(found) = list
-                    .iter_mut()
-                    .find(|d| bool::from(d.device_token.as_bytes().ct_eq(dev_tok.as_bytes())))
-                {
-                    if let Some(ref name) = clean_name {
-                        if found.device_name != *name {
-                            found.device_name = name.clone();
-                            save_trusted_devices(
-                                &self.data_dir.join("trusted_devices.json"),
-                                &list,
-                            );
-                        }
-                    }
-                    return HelloAuthOutcome::Trusted {
-                        device_name: clean_name,
-                    };
-                }
+            if self.check_trusted_device_token(dev_tok, clean_name.as_ref()) {
+                return HelloAuthOutcome::Trusted {
+                    device_name: clean_name,
+                };
             }
             return HelloAuthOutcome::Rejected {
                 reason: "device_token_unknown".to_string(),
@@ -290,6 +291,31 @@ impl PairingManager {
                 created_unix: d.created_unix,
             })
             .collect()
+    }
+
+    fn check_trusted_device_token(&self, dev_tok: &str, clean_name: Option<&String>) -> bool {
+        let path = self.data_dir.join("trusted_devices.json");
+        let Ok(mut list) = self.trusted_devices.lock() else {
+            return false;
+        };
+        if let Some(found) = list
+            .iter_mut()
+            .find(|d| bool::from(d.device_token.as_bytes().ct_eq(dev_tok.as_bytes())))
+        {
+            if let Some(name) = clean_name {
+                if found.device_name != *name {
+                    found.device_name = name.clone();
+                    save_trusted_devices(&path, &list);
+                }
+            }
+            return true;
+        }
+        let disk = load_trusted_devices(&path);
+        if disk.iter().any(|d| bool::from(d.device_token.as_bytes().ct_eq(dev_tok.as_bytes()))) {
+            *list = disk;
+            return true;
+        }
+        false
     }
 
     pub fn revoke_trusted_device(&self, device_id: &str) -> Option<String> {
@@ -688,6 +714,33 @@ mod tests {
         let removed = mgr.revoke_trusted_device(&listed[0].device_id);
         assert_eq!(removed.as_deref(), Some("HectorZaGa"));
         assert!(mgr.list_trusted_devices().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_expired_pair_falls_back_to_valid_device_token_for_local_transport() {
+        let dir = temp_dir("pair_fallback");
+        let mgr = PairingManager::with_data_dir(dir.clone(), "HECTOR-MASTER".to_string());
+        let (tok, _) = mgr.issue_ephemeral_token();
+        let first = format!(r#"{{"device_name":"HectorZaG","pair_token":"{}"}}"#, tok);
+        let dev_token = match mgr.validate_hello_payload(first.as_bytes()) {
+            HelloAuthOutcome::Paired { new_device_token, .. } => new_device_token,
+            other => panic!("expected Paired, got {:?}", other),
+        };
+
+        let stale_local = format!(
+            r#"{{"device_name":"HectorZaG","pair_token":"PAIR-EXPIRED","device_token":"{}"}}"#,
+            dev_token
+        );
+        assert!(matches!(
+            mgr.validate_hello_payload_for_transport(stale_local.as_bytes(), false),
+            HelloAuthOutcome::Trusted { .. }
+        ));
+        assert!(matches!(
+            mgr.validate_hello_payload_for_transport(stale_local.as_bytes(), true),
+            HelloAuthOutcome::Rejected { .. }
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
