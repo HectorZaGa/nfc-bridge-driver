@@ -8,7 +8,7 @@
 use futures_util::{SinkExt, StreamExt};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio_tungstenite::{
@@ -97,16 +97,24 @@ impl RelayClient {
                     info!("Túnel Cloud Relay activo (canal={})", channel);
 
                     let (mut ws_write, mut ws_read) = ws_stream.split();
-                    let (bridge_io, driver_io) = tokio::io::duplex(64 * 1024);
-                    let (mut bridge_r, mut bridge_w) = tokio::io::split(bridge_io);
-                    let (driver_r, driver_w) = tokio::io::split(driver_io);
+                    let mut ping_interval = tokio::time::interval(Duration::from_secs(25));
+                    ping_interval.tick().await;
+                    let mut last_ws_rx = Instant::now();
 
-                    let coord = Arc::clone(&self.coordinator);
-                    let stream_task = tokio::spawn(async move {
-                        coord
-                            .handle_stream(driver_r, driver_w, "Cloud Relay".to_string())
-                            .await;
-                    });
+                    let spawn_session = |coord: &Arc<BridgeTcpServer>| {
+                        let (bridge_io, driver_io) = tokio::io::duplex(64 * 1024);
+                        let (bridge_r, bridge_w) = tokio::io::split(bridge_io);
+                        let (driver_r, driver_w) = tokio::io::split(driver_io);
+                        let c = Arc::clone(coord);
+                        let task = tokio::spawn(async move {
+                            c.handle_stream(driver_r, driver_w, "Cloud Relay".to_string())
+                                .await;
+                        });
+                        (bridge_r, bridge_w, task)
+                    };
+
+                    let (mut bridge_r, mut bridge_w, mut stream_task) =
+                        spawn_session(&self.coordinator);
 
                     let mut out_buf = [0u8; 8192];
                     loop {
@@ -115,20 +123,37 @@ impl RelayClient {
                                 let _ = ws_write.close().await;
                                 break;
                             }
+                            _ = ping_interval.tick() => {
+                                if last_ws_rx.elapsed() > Duration::from_secs(75) {
+                                    warn!("Sin respuesta keepalive del Cloud Relay; reconectando...");
+                                    let _ = ws_write.close().await;
+                                    break;
+                                }
+                                if ws_write.send(Message::Ping(b"hb".to_vec().into())).await.is_err() {
+                                    break;
+                                }
+                            }
                             ws_msg = ws_read.next() => {
                                 match ws_msg {
                                     Some(Ok(Message::Binary(bytes))) => {
+                                        last_ws_rx = Instant::now();
                                         if bridge_w.write_all(&bytes).await.is_err() {
                                             break;
                                         }
                                     }
                                     Some(Ok(Message::Ping(p))) => {
+                                        last_ws_rx = Instant::now();
                                         if ws_write.send(Message::Pong(p)).await.is_err() {
                                             break;
                                         }
                                     }
+                                    Some(Ok(Message::Pong(_))) => {
+                                        last_ws_rx = Instant::now();
+                                    }
                                     Some(Ok(Message::Close(_))) | None => break,
-                                    Some(Ok(_)) => {}
+                                    Some(Ok(_)) => {
+                                        last_ws_rx = Instant::now();
+                                    }
                                     Some(Err(e)) => {
                                         debug!("Error WS Cloud Relay: {}", e);
                                         break;
@@ -137,7 +162,14 @@ impl RelayClient {
                             }
                             read_res = bridge_r.read(&mut out_buf) => {
                                 match read_res {
-                                    Ok(0) | Err(_) => break,
+                                    Ok(0) | Err(_) => {
+                                        // Sesión del móvil terminó cleanly; rearmar pipe manteniendo el túnel PC abierto
+                                        let _ = stream_task.await;
+                                        let next = spawn_session(&self.coordinator);
+                                        bridge_r = next.0;
+                                        bridge_w = next.1;
+                                        stream_task = next.2;
+                                    }
                                     Ok(n) => {
                                         if ws_write.send(Message::Binary(out_buf[..n].to_vec().into())).await.is_err() {
                                             break;

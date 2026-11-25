@@ -11,7 +11,7 @@ use subtle::ConstantTimeEq;
 
 use crate::ipc::events::TrustedDeviceInfo;
 
-const DEFAULT_PAIR_TTL_SECS: u64 = 90;
+const DEFAULT_PAIR_TTL_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustedDevice {
@@ -66,6 +66,7 @@ pub struct PairingManager {
     relay_channel: Mutex<String>,
     relay_host_secret: Mutex<String>,
     relay_url: Mutex<Option<String>>,
+    tcp_cert_sha256: Mutex<Option<String>>,
 }
 
 impl PairingManager {
@@ -91,7 +92,18 @@ impl PairingManager {
             relay_channel: Mutex::new(channel),
             relay_host_secret: Mutex::new(host_secret),
             relay_url: Mutex::new(relay_url),
+            tcp_cert_sha256: Mutex::new(None),
         }
+    }
+
+    pub fn set_tcp_cert_sha256(&self, sha256: Option<String>) {
+        if let Ok(mut guard) = self.tcp_cert_sha256.lock() {
+            *guard = sha256.map(|s| s.trim().to_lowercase()).filter(|s| s.len() == 64);
+        }
+    }
+
+    pub fn get_tcp_cert_sha256(&self) -> Option<String> {
+        self.tcp_cert_sha256.lock().ok().and_then(|g| g.clone())
     }
 
     pub fn pc_name(&self) -> &str {
@@ -307,14 +319,19 @@ impl PairingManager {
                 let host = wfd_ip.unwrap_or("192.168.137.1");
                 let ssid = wfd_ssid.unwrap_or("");
                 let pass = wfd_pass.unwrap_or("");
+                let cert_suffix = self
+                    .get_tcp_cert_sha256()
+                    .map(|c| format!("&cert={}", percent_encode_query(&c)))
+                    .unwrap_or_default();
                 let uri = format!(
-                    "nfcbridge://{}:{}?name={}&transport=wifi_direct&ssid={}&pass={}&pair={}",
+                    "nfcbridge://{}:{}?name={}&transport=wifi_direct&ssid={}&pass={}&pair={}{}",
                     host,
                     tcp_port,
                     encoded_name,
                     percent_encode_query(ssid),
                     percent_encode_query(pass),
                     percent_encode_query(pair_token),
+                    cert_suffix,
                 );
                 (uri, None)
             }
@@ -351,12 +368,17 @@ impl PairingManager {
             _ => {
                 // tcp (Red Local)
                 let ip = tcp_ip.unwrap_or("127.0.0.1");
+                let cert_suffix = self
+                    .get_tcp_cert_sha256()
+                    .map(|c| format!("&cert={}", percent_encode_query(&c)))
+                    .unwrap_or_default();
                 let uri = format!(
-                    "nfcbridge://{}:{}?name={}&transport=tcp&pair={}",
+                    "nfcbridge://{}:{}?name={}&transport=tcp&pair={}{}",
                     ip,
                     tcp_port,
                     encoded_name,
                     percent_encode_query(pair_token),
+                    cert_suffix,
                 );
                 (uri, None)
             }
@@ -570,7 +592,7 @@ mod tests {
         let dir = temp_dir("pair_once");
         let mgr = PairingManager::with_data_dir(dir.clone(), "HECTOR-MASTER".to_string());
         let (pair_token, ttl) = mgr.issue_ephemeral_token();
-        assert_eq!(ttl, 90);
+        assert_eq!(ttl, 300);
 
         let syn1 = format!(r#"{{"device_name":"Morduuk","pair_token":"{}"}}"#, pair_token);
         let outcome1 = mgr.validate_hello_payload(syn1.as_bytes());

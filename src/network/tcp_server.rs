@@ -17,6 +17,7 @@ use tracing::{debug, error, info, warn};
 use crate::emulator::CcidHandler;
 use crate::ipc::events::IpcEvent;
 use crate::network::pairing_manager::{parse_hello_paused, HelloAuthOutcome, PairingManager};
+use crate::network::tls_cert;
 use crate::protocol::codec::{FrameCodec, StreamFrameDecoder};
 use crate::protocol::constants::DEFAULT_TCP_PORT;
 use crate::protocol::crc::compute_crc16;
@@ -44,6 +45,7 @@ pub struct BridgeTcpServer {
     runtime_status: Arc<Mutex<DriverRuntimeStatus>>,
     is_paused: AtomicBool,
     disconnect_notify: Arc<Notify>,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 }
 
 impl BridgeTcpServer {
@@ -57,6 +59,16 @@ impl BridgeTcpServer {
         ccid_handler: Arc<Mutex<CcidHandler>>,
         pairing: Arc<PairingManager>,
     ) -> Self {
+        let tls_acceptor = match tls_cert::load_or_create_default() {
+            Ok(id) => {
+                pairing.set_tcp_cert_sha256(Some(id.cert_sha256_hex));
+                Some(id.acceptor)
+            }
+            Err(e) => {
+                warn!("No se pudo inicializar certificado TLS local: {}", e);
+                None
+            }
+        };
         Self {
             event_tx,
             ccid_handler,
@@ -67,6 +79,7 @@ impl BridgeTcpServer {
             runtime_status: Arc::new(Mutex::new(DriverRuntimeStatus::default())),
             is_paused: AtomicBool::new(false),
             disconnect_notify: Arc::new(Notify::new()),
+            tls_acceptor,
         }
     }
 
@@ -133,12 +146,17 @@ impl BridgeTcpServer {
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         let addr = format!("0.0.0.0:{}", DEFAULT_TCP_PORT);
         let listener = TcpListener::bind(&addr).await?;
-        info!("Driver TCP escuchando en {} (Esperando teléfono Android)", addr);
+        let cert_fp = self.pairing.get_tcp_cert_sha256();
+        info!(
+            "Driver TCP{} escuchando en {} (Esperando teléfono Android)",
+            if self.tls_acceptor.is_some() { "+TLS" } else { "" },
+            addr
+        );
 
         // Iniciar responder UDP en el mismo puerto 45362 para auto-descubrimiento en red Wi-Fi / LAN
-        let pc_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "NFC Bridge PC".to_string());
+        let pc_name = self.pairing.pc_name().to_string();
         tokio::spawn(async move {
-            if let Err(e) = Self::run_udp_discovery_responder(DEFAULT_TCP_PORT, pc_name).await {
+            if let Err(e) = Self::run_udp_discovery_responder(DEFAULT_TCP_PORT, pc_name, cert_fp).await {
                 warn!("UDP discovery responder en driver finalizó con error: {}", e);
             }
         });
@@ -159,7 +177,11 @@ impl BridgeTcpServer {
         }
     }
 
-    async fn run_udp_discovery_responder(port: u16, pc_name: String) -> anyhow::Result<()> {
+    async fn run_udp_discovery_responder(
+        port: u16,
+        pc_name: String,
+        cert_sha256: Option<String>,
+    ) -> anyhow::Result<()> {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         let socket = UdpSocket::bind(addr).await?;
         info!("Driver UDP auto-descubrimiento activo en {}", addr);
@@ -177,10 +199,17 @@ impl BridgeTcpServer {
                             compute_crc16(pc_name.as_bytes()),
                             compute_crc16(&port.to_le_bytes())
                         );
-                        let response = format!(
-                            r#"{{"id":"{}","name":"{}","port":{},"model":"WINDOWS","status":"ready"}}"#,
-                            pc_id, pc_name, port
-                        );
+                        let mut resp_json = serde_json::json!({
+                            "id": pc_id,
+                            "name": pc_name,
+                            "port": port,
+                            "model": "WINDOWS",
+                            "status": "ready"
+                        });
+                        if let (Some(ref c), Some(obj)) = (&cert_sha256, resp_json.as_object_mut()) {
+                            obj.insert("cert".to_string(), serde_json::Value::String(c.clone()));
+                        }
+                        let response = resp_json.to_string();
                         if let Err(e) = socket.send_to(response.as_bytes(), peer_addr).await {
                             warn!("Error respondiendo descubrimiento UDP a {}: {}", peer_addr, e);
                         } else {
@@ -249,6 +278,22 @@ impl BridgeTcpServer {
     async fn handle_client(&self, socket: TcpStream, peer_endpoint: String) {
         if let Err(e) = socket.set_nodelay(true) {
             warn!("No se pudo configurar TCP_NODELAY: {}", e);
+        }
+
+        if let Some(ref acceptor) = self.tls_acceptor {
+            match tokio::time::timeout(Duration::from_secs(6), acceptor.accept(socket)).await {
+                Ok(Ok(tls_stream)) => {
+                    let (reader, writer) = tokio::io::split(tls_stream);
+                    self.handle_stream(reader, writer, peer_endpoint).await;
+                }
+                Ok(Err(e)) => {
+                    warn!("Handshake TLS rechazado desde {}: {}", peer_endpoint, e);
+                }
+                Err(_) => {
+                    warn!("Timeout en handshake TLS desde {}", peer_endpoint);
+                }
+            }
+            return;
         }
 
         let (reader, writer) = socket.into_split();

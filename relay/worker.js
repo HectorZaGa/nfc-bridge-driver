@@ -23,7 +23,9 @@ function constantTimeEqual(a, b) {
 export class RelayRoom {
   constructor(state) {
     this.state = state;
-    this.sockets = { pc: null, mobile: null };
+    if (typeof this.state.setWebSocketAutoResponse === "function") {
+      this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+    }
   }
 
   async fetch(request) {
@@ -47,54 +49,58 @@ export class RelayRoom {
       } else if (!constantTimeEqual(storedHash, presentedHash)) {
         return new Response("Invalid host secret", { status: 403 });
       }
-    } else if (!this.sockets.pc || this.sockets.pc.readyState !== 1) {
-      return new Response("PC offline", { status: 409 });
+    } else {
+      const pcs = this.state.getWebSockets("pc");
+      if (!pcs || pcs.length === 0) {
+        return new Response("PC offline", { status: 409 });
+      }
+    }
+
+    for (const existing of this.state.getWebSockets(role)) {
+      try {
+        existing.close(1000, "replaced");
+      } catch (_) {}
     }
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    server.accept();
-
-    const prev = this.sockets[role];
-    if (prev) {
-      try {
-        prev.close(1000, "replaced");
-      } catch (_) {}
-    }
-    this.sockets[role] = server;
-
-    const peerRole = role === "pc" ? "mobile" : "pc";
-
-    server.addEventListener("message", (evt) => {
-      const byteLen =
-        typeof evt.data === "string"
-          ? evt.data.length
-          : evt.data?.byteLength ?? 0;
-      if (byteLen > MAX_WS_PAYLOAD_BYTES) {
-        try {
-          server.close(1009, "payload_too_large");
-        } catch (_) {}
-        return;
-      }
-
-      const peer = this.sockets[peerRole];
-      if (peer && peer.readyState === 1) {
-        try {
-          peer.send(evt.data);
-        } catch (_) {}
-      }
-    });
-
-    const cleanup = () => {
-      if (this.sockets[role] === server) {
-        this.sockets[role] = null;
-      }
-    };
-
-    server.addEventListener("close", cleanup);
-    server.addEventListener("error", cleanup);
+    this.state.acceptWebSocket(server, [role]);
 
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(ws, message) {
+    const byteLen =
+      typeof message === "string"
+        ? message.length
+        : message?.byteLength ?? 0;
+    if (byteLen > MAX_WS_PAYLOAD_BYTES) {
+      try {
+        ws.close(1009, "payload_too_large");
+      } catch (_) {}
+      return;
+    }
+
+    const tags = this.state.getTags(ws);
+    const role = tags[0] === "pc" ? "pc" : "mobile";
+    const peerRole = role === "pc" ? "mobile" : "pc";
+    for (const peer of this.state.getWebSockets(peerRole)) {
+      try {
+        peer.send(message);
+      } catch (_) {}
+    }
+  }
+
+  async webSocketClose(ws, code, reason) {
+    try {
+      ws.close(code || 1000, reason || "closed");
+    } catch (_) {}
+  }
+
+  async webSocketError(ws) {
+    try {
+      ws.close(1011, "error");
+    } catch (_) {}
   }
 }
 
@@ -160,18 +166,19 @@ function escapeHtml(s) {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
-function escapeJsonForScript(val) {
-  return JSON.stringify(val)
+function escapeJsonForScript(s) {
+  return JSON.stringify(s)
     .replaceAll("<", "\\u003c")
     .replaceAll(">", "\\u003e")
     .replaceAll("&", "\\u0026");
 }
 
 function renderLandingHtml(deepLink) {
-  const safe = escapeHtml(deepLink);
-  const safeJs = escapeJsonForScript(deepLink);
-  return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NFC Bridge — Vincular PC</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#121212;color:#f3f0ef;font-family:system-ui,-apple-system,sans-serif;padding:24px}.card{max-width:420px;width:100%;background:#1e1e1e;border:1px solid #313030;border-radius:16px;padding:24px;text-align:center}a.btn{display:inline-block;margin-top:16px;padding:12px 20px;border-radius:10px;background:#3b82f6;color:#fff;text-decoration:none;font-weight:600}p{color:#adabaa;font-size:14px;line-height:1.5}</style></head><body><div class="card"><h2>NFC Bridge Lite</h2><p>Abriendo enlace directo de vinculación con tu PC...</p><a class="btn" href="${safe}">Abrir en NFC Bridge</a></div><script>window.location.href=${safeJs};</script></body></html>`;
+  const safeHref = escapeHtml(deepLink);
+  const safeJsHref = escapeJsonForScript(deepLink);
+  return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Conectar NFC Bridge</title><style>body{background:#121212;color:#f3f0ef;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;box-sizing:border-box}.card{max-width:420px;width:100%;background:#1e1e1e;border:1px solid #313030;border-radius:16px;padding:24px;text-align:center}a.btn{display:block;margin-top:16px;padding:12px 18px;border-radius:10px;background:#3b82f6;color:#fff;text-decoration:none;font-weight:600}p{color:#adabaa;font-size:14px;line-height:1.4}</style></head><body><div class="card"><h2>NFC Bridge</h2><p>Pulsa el botón para abrir NFC Bridge Lite y enlazar este teléfono de forma segura.</p><a class="btn" href="${safeHref}">Abrir en NFC Bridge Lite</a><p style="margin-top:14px;font-size:12px">Si no se abre automáticamente, copia este enlace y pégalo en la opción Enlace remoto de la app.</p></div><script>setTimeout(function(){window.location.href=${safeJsHref};},150);</script></body></html>`;
 }
