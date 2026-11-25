@@ -1,6 +1,6 @@
 [package]
 name = "nfc-bridge-driver"
-version = "0.1.18"
+version = "0.1.19"
 edition = "2021"
 authors = ["Hector Zarate <HectorZaGa96@hotmail.com>"]
 description = "Ultra-low latency NFC bridge background driver and PC/SC emulator for Windows"

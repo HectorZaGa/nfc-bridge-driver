@@ -634,14 +634,27 @@ impl PairingManager {
         Some((display_name, dev_id))
     }
 
-    pub fn revoke_trusted_device(&self, device_id: &str) -> Option<String> {
+    pub fn revoke_trusted_device(&self, device_id: &str) -> Option<TrustedDeviceInfo> {
         let mut list = self.trusted_devices.lock().ok()?;
         let pos = list
             .iter()
             .position(|d| device_public_id(&d.device_token) == device_id)?;
         let removed = list.remove(pos);
         save_trusted_devices(&self.data_dir.join("trusted_devices.json"), &list);
-        Some(removed.device_name)
+        Some(TrustedDeviceInfo {
+            device_id: device_public_id(&removed.device_token),
+            device_name: removed
+                .custom_name
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(&removed.device_name)
+                .to_string(),
+            created_unix: removed.created_unix,
+            mobile_id: removed.mobile_id,
+            device_os: removed.device_os,
+            transport: removed.transport,
+            endpoint: removed.endpoint,
+        })
     }
 
     pub fn build_qr_and_link(
@@ -1192,7 +1205,7 @@ mod tests {
         assert!(listed[0].device_id.starts_with("dev-"));
 
         let removed = mgr.revoke_trusted_device(&listed[0].device_id);
-        assert_eq!(removed.as_deref(), Some("HectorZaGa"));
+        assert_eq!(removed.as_ref().map(|d| d.device_name.as_str()), Some("HectorZaGa"));
         assert!(mgr.list_trusted_devices().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);

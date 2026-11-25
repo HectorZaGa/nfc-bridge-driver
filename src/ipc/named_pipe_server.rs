@@ -458,19 +458,53 @@ impl NamedPipeIpcServer {
                                                     .pairing
                                                     .as_ref()
                                                     .and_then(|p| p.revoke_trusted_device(&device_id));
-                                                if let Some(removed_name) = removed {
-                                                    if let Some(ref coord) = this.coordinator {
+                                                if let Some(removed_info) = removed {
+                                                    if let (Some(ref coord), Some(ref pairing)) =
+                                                        (this.coordinator.as_ref(), this.pairing.as_ref())
+                                                    {
                                                         if let IpcEvent::Status {
                                                             connected: true,
                                                             device_name: active_name,
+                                                            mobile_id: active_mid,
                                                             active_device_id,
                                                             ..
                                                         } = coord.get_status_event().await
                                                         {
-                                                            if active_device_id.as_deref() == Some(device_id.as_str())
-                                                                || active_name.as_deref() == Some(removed_name.as_str())
-                                                            {
-                                                                coord.disconnect_active().await;
+                                                            let is_active = active_device_id
+                                                                .as_deref()
+                                                                == Some(device_id.as_str())
+                                                                || (active_device_id.is_none()
+                                                                    && active_name.as_deref()
+                                                                        == Some(
+                                                                            removed_info
+                                                                                .device_name
+                                                                                .as_str(),
+                                                                        ));
+                                                            let same_phone = is_active
+                                                                || match (
+                                                                    &active_mid,
+                                                                    &removed_info.mobile_id,
+                                                                ) {
+                                                                    (Some(a), Some(b)) => {
+                                                                        a.eq_ignore_ascii_case(b)
+                                                                    }
+                                                                    _ => false,
+                                                                };
+                                                            if same_phone {
+                                                                let payload = serde_json::json!({
+                                                                    "pc_name": pairing.pc_name(),
+                                                                    "transport": removed_info.transport,
+                                                                    "channel": pairing.get_relay_channel(),
+                                                                    "endpoint": removed_info.endpoint,
+                                                                    "active": is_active,
+                                                                })
+                                                                .to_string();
+                                                                coord
+                                                                    .notify_profile_revoked(
+                                                                        payload,
+                                                                        is_active,
+                                                                    )
+                                                                    .await;
                                                             }
                                                         }
                                                     }

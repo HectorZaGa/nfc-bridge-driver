@@ -305,9 +305,29 @@ impl BridgeTcpServer {
                 payload_json.into_bytes(),
             );
             let _ = tx.send(frame).await;
-            tokio::time::sleep(Duration::from_millis(120)).await;
         }
-        self.disconnect_notify.notify_waiters();
+    }
+
+    pub async fn notify_profile_revoked(&self, payload_json: String, disconnect_session: bool) {
+        let client_tx = {
+            let guard = self.active_client_tx.lock().await;
+            guard.clone()
+        };
+        if let Some(tx) = client_tx {
+            let seq = self.sequence_counter.fetch_add(1, Ordering::SeqCst);
+            let frame = NfcBridgeFrame::new(
+                MessageType::ProfileRevoked,
+                seq,
+                payload_json.into_bytes(),
+            );
+            let _ = tx.send(frame).await;
+            if disconnect_session {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+            }
+        }
+        if disconnect_session {
+            self.disconnect_notify.notify_waiters();
+        }
     }
 
     /// Inicia el listener TCP y el responder UDP de auto-descubrimiento en el puerto 45362.
