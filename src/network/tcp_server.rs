@@ -16,7 +16,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::emulator::CcidHandler;
 use crate::ipc::events::IpcEvent;
-use crate::network::pairing_manager::{parse_hello_paused, HelloAuthOutcome, PairingManager};
+use crate::network::pairing_manager::{
+    parse_hello_paused, HelloAuthOutcome, HelloAuthResult, PairingManager,
+};
 use crate::network::tls_cert;
 use crate::protocol::codec::{FrameCodec, StreamFrameDecoder};
 use crate::protocol::constants::DEFAULT_TCP_PORT;
@@ -55,6 +57,9 @@ pub struct BridgeTcpServer {
     wfd_host_ip: Arc<StdMutex<Option<String>>>,
     usb_auto_connect: AtomicBool,
     usb_active: AtomicBool,
+    tcp_rebind_notify: Arc<Notify>,
+    pending_switch: Arc<Mutex<Option<(String, oneshot::Sender<bool>)>>>,
+    approved_sync_switch: Arc<Mutex<Option<(Option<String>, String, Instant)>>>,
 }
 
 impl BridgeTcpServer {
@@ -94,7 +99,115 @@ impl BridgeTcpServer {
             wfd_host_ip: Arc::new(StdMutex::new(None)),
             usb_auto_connect: AtomicBool::new(true),
             usb_active: AtomicBool::new(false),
+            tcp_rebind_notify: Arc::new(Notify::new()),
+            pending_switch: Arc::new(Mutex::new(None)),
+            approved_sync_switch: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn trigger_tcp_rebind(&self) {
+        self.tcp_rebind_notify.notify_waiters();
+    }
+
+    pub async fn mark_approved_sync_switch(&self, mobile_id: Option<String>, transport: String) {
+        let mut guard = self.approved_sync_switch.lock().await;
+        *guard = Some((mobile_id, transport, Instant::now() + Duration::from_secs(20)));
+    }
+
+    pub async fn respond_mobile_switch(&self, request_id: &str, accept: bool) -> bool {
+        let mut guard = self.pending_switch.lock().await;
+        if let Some((ref cur_id, _)) = *guard {
+            if cur_id == request_id {
+                if let Some((_, tx)) = guard.take() {
+                    let _ = tx.send(accept);
+                    let _ = self.event_tx.send(IpcEvent::PendingMobileSwitchCleared {
+                        request_id: request_id.to_string(),
+                    });
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    async fn confirm_mobile_takeover_if_needed(
+        &self,
+        auth_res: &HelloAuthResult,
+        device_label: &str,
+        is_fresh_qr_pair: bool,
+    ) -> bool {
+        let (is_connected, active_id) = {
+            let st = self.runtime_status.lock().await;
+            (st.connected, st.active_device_id.clone())
+        };
+        if !is_connected || active_id == auth_res.device_id {
+            return true;
+        }
+        if self.pairing.get_auto_accept_mobile_switch() || is_fresh_qr_pair {
+            self.disconnect_notify.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            return true;
+        }
+        {
+            let mut app_guard = self.approved_sync_switch.lock().await;
+            if let Some((ref exp_mid, ref exp_tr, expires)) = *app_guard {
+                if Instant::now() < expires && *exp_tr == auth_res.transport {
+                    let mid_match = match (exp_mid, &auth_res.mobile_id) {
+                        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                        _ => true,
+                    };
+                    if mid_match {
+                        *app_guard = None;
+                        self.disconnect_notify.notify_waiters();
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        let seq = self.sequence_counter.fetch_add(1, Ordering::SeqCst);
+        let req_id = format!("sw-{}-{}", seq, std::process::id());
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut guard = self.pending_switch.lock().await;
+            if let Some((old_id, old_tx)) = guard.take() {
+                let _ = old_tx.send(false);
+                let _ = self.event_tx.send(IpcEvent::PendingMobileSwitchCleared {
+                    request_id: old_id,
+                });
+            }
+            *guard = Some((req_id.clone(), tx));
+        }
+
+        let _ = self.event_tx.send(IpcEvent::PendingMobileSwitch {
+            request_id: req_id.clone(),
+            device_id: auth_res.device_id.clone(),
+            device_name: device_label.to_string(),
+            mobile_id: auth_res.mobile_id.clone(),
+            device_os: Some(auth_res.device_os.clone()),
+            transport: auth_res.transport.clone(),
+        });
+
+        let accepted = match tokio::time::timeout(Duration::from_secs(25), rx).await {
+            Ok(Ok(val)) => val,
+            _ => false,
+        };
+        {
+            let mut guard = self.pending_switch.lock().await;
+            if guard.as_ref().is_some_and(|(id, _)| id == &req_id) {
+                *guard = None;
+            }
+        }
+        let _ = self.event_tx.send(IpcEvent::PendingMobileSwitchCleared {
+            request_id: req_id,
+        });
+
+        if accepted {
+            self.disconnect_notify.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        accepted
     }
 
     pub fn is_tcp_enabled(&self) -> bool {
@@ -330,53 +443,92 @@ impl BridgeTcpServer {
         }
     }
 
-    /// Inicia el listener TCP y el responder UDP de auto-descubrimiento en el puerto 45362.
+    /// Inicia el listener TCP y el responder UDP de auto-descubrimiento (puerto configurable).
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
-        let addr = format!("0.0.0.0:{}", DEFAULT_TCP_PORT);
-        let listener = TcpListener::bind(&addr).await?;
-        let cert_fp = self.pairing.get_tcp_cert_sha256();
-        info!(
-            "Driver TCP{} escuchando en {} (Esperando teléfono Android)",
-            if self.tls_acceptor.is_some() { "+TLS" } else { "" },
-            addr
-        );
-
-        // Iniciar responder UDP en el mismo puerto 45362 para auto-descubrimiento en red Wi-Fi / LAN
-        let pc_name = self.pairing.pc_name().to_string();
-        let tcp_enabled_udp = Arc::clone(&self.tcp_enabled);
-        tokio::spawn(async move {
-            if let Err(e) = Self::run_udp_discovery_responder(
-                DEFAULT_TCP_PORT,
-                pc_name,
-                cert_fp,
-                tcp_enabled_udp,
-            )
-            .await
-            {
-                warn!("UDP discovery responder en driver finalizó con error: {}", e);
-            }
-        });
-
         loop {
-            match listener.accept().await {
-                Ok((socket, peer_addr)) => {
-                    if !self.should_accept_tcp_socket(&socket, peer_addr) {
-                        debug!(
-                            "Conexión TCP rechazada desde {} (Red Local TCP desactivada)",
-                            peer_addr
-                        );
-                        drop(socket);
-                        continue;
-                    }
-                    info!("Dispositivo Android conectado vía TCP desde: {}", peer_addr);
-                    let server = Arc::clone(&self);
-                    tokio::spawn(async move {
-                        server.handle_client(socket, peer_addr.to_string()).await;
-                    });
-                }
+            let port = self.pairing.get_tcp_port();
+            let addr = format!("0.0.0.0:{}", port);
+            let listener = match TcpListener::bind(&addr).await {
+                Ok(l) => l,
                 Err(e) => {
-                    error!("Error al aceptar conexión TCP: {}", e);
+                    if port != DEFAULT_TCP_PORT {
+                        warn!(
+                            "No se pudo enlazar puerto manual {} ({}); usando {} por defecto.",
+                            port, e, DEFAULT_TCP_PORT
+                        );
+                        TcpListener::bind(format!("0.0.0.0:{}", DEFAULT_TCP_PORT)).await?
+                    } else {
+                        return Err(e.into());
+                    }
                 }
+            };
+            let active_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+            let cert_fp = self.pairing.get_tcp_cert_sha256();
+            info!(
+                "Driver TCP{} escuchando en 0.0.0.0:{} (Esperando teléfono móvil)",
+                if self.tls_acceptor.is_some() { "+TLS" } else { "" },
+                active_port
+            );
+
+            let udp_stop = Arc::new(Notify::new());
+            let udp_stop_task = Arc::clone(&udp_stop);
+            let pc_name = self.pairing.pc_name().to_string();
+            let tcp_enabled_udp = Arc::clone(&self.tcp_enabled);
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = udp_stop_task.notified() => {},
+                    res = Self::run_udp_discovery_responder(
+                        active_port,
+                        pc_name,
+                        cert_fp,
+                        tcp_enabled_udp,
+                    ) => {
+                        if let Err(e) = res {
+                            warn!("UDP discovery responder en driver finalizó con error: {}", e);
+                        }
+                    }
+                }
+            });
+
+            let mut rebind_requested = false;
+            loop {
+                tokio::select! {
+                    _ = self.tcp_rebind_notify.notified() => {
+                        info!("Reiniciando escucha TCP/UDP por cambio de configuración de red...");
+                        rebind_requested = true;
+                        break;
+                    }
+                    accept_res = listener.accept() => {
+                        match accept_res {
+                            Ok((socket, peer_addr)) => {
+                                if !self.should_accept_tcp_socket(&socket, peer_addr) {
+                                    debug!(
+                                        "Conexión TCP rechazada desde {} (Red Local TCP desactivada)",
+                                        peer_addr
+                                    );
+                                    drop(socket);
+                                    continue;
+                                }
+                                info!("Dispositivo móvil conectado vía TCP desde: {}", peer_addr);
+                                let server = Arc::clone(&self);
+                                tokio::spawn(async move {
+                                    server.handle_client(socket, peer_addr.to_string()).await;
+                                });
+                            }
+                            Err(e) => {
+                                error!("Error al aceptar conexión TCP: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            udp_stop.notify_waiters();
+            drop(listener);
+            if rebind_requested {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(300)).await;
             }
         }
     }
@@ -671,9 +823,35 @@ impl BridgeTcpServer {
                     &fallback_tr,
                     peer_endpoint,
                 );
-                match auth_res.outcome {
+                let auth_outcome = auth_res.outcome.clone();
+                match auth_outcome {
                     HelloAuthOutcome::Rejected { reason } => {
                         warn!("Handshake HELLO_SYN rechazado ({})", reason);
+                        if reason == "device_token_unknown"
+                            || reason == "pairing_credentials_missing"
+                            || reason == "token_required"
+                        {
+                            let dev_info = auth_res
+                                .device_id
+                                .as_deref()
+                                .and_then(|id| self.pairing.get_trusted_device(id))
+                                .or_else(|| {
+                                    self.pairing.find_trusted_device_by_meta(
+                                        auth_res.mobile_id.as_deref(),
+                                        &auth_res.transport,
+                                        None,
+                                    )
+                                });
+                            if let Some(info) = dev_info {
+                                let _ = self.event_tx.send(IpcEvent::PairingInvalidNotice {
+                                    device_id: Some(info.device_id),
+                                    device_name: info.device_name,
+                                    mobile_id: auth_res.mobile_id.clone(),
+                                    transport: Some(auth_res.transport.clone()),
+                                    reason: reason.clone(),
+                                });
+                            }
+                        }
                         let payload = serde_json::json!({
                             "pc_name": pc_name,
                             "status": "rejected",
@@ -697,6 +875,33 @@ impl BridgeTcpServer {
                         device_name,
                         new_device_token,
                     } => {
+                        let label = device_name
+                            .clone()
+                            .unwrap_or_else(|| "Dispositivo móvil".to_string());
+                        if !self
+                            .confirm_mobile_takeover_if_needed(&auth_res, &label, true)
+                            .await
+                        {
+                            let payload = serde_json::json!({
+                                "pc_name": pc_name,
+                                "status": "rejected",
+                                "reason": "switch_declined_by_pc"
+                            })
+                            .to_string();
+                            let _ = out_tx
+                                .send(NfcBridgeFrame::new(
+                                    MessageType::HelloAck,
+                                    frame.sequence_id,
+                                    payload.into_bytes(),
+                                ))
+                                .await;
+                            let cancel = Arc::clone(session_cancel);
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_millis(80)).await;
+                                cancel.notify_waiters();
+                            });
+                            return false;
+                        }
                         info!("Handshake HELLO_SYN emparejado (nuevo device_token emitido)");
                         self.accept_hello_session(
                             device_name,
@@ -716,6 +921,33 @@ impl BridgeTcpServer {
                     }
                     HelloAuthOutcome::Trusted { device_name }
                     | HelloAuthOutcome::LegacyAllowed { device_name } => {
+                        let label = device_name
+                            .clone()
+                            .unwrap_or_else(|| "Dispositivo móvil".to_string());
+                        if !self
+                            .confirm_mobile_takeover_if_needed(&auth_res, &label, false)
+                            .await
+                        {
+                            let payload = serde_json::json!({
+                                "pc_name": pc_name,
+                                "status": "rejected",
+                                "reason": "switch_declined_by_pc"
+                            })
+                            .to_string();
+                            let _ = out_tx
+                                .send(NfcBridgeFrame::new(
+                                    MessageType::HelloAck,
+                                    frame.sequence_id,
+                                    payload.into_bytes(),
+                                ))
+                                .await;
+                            let cancel = Arc::clone(session_cancel);
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_millis(80)).await;
+                                cancel.notify_waiters();
+                            });
+                            return false;
+                        }
                         info!("Handshake HELLO_SYN recibido del móvil. Respondiendo HELLO_ACK...");
                         self.accept_hello_session(
                             device_name,
@@ -823,6 +1055,50 @@ impl BridgeTcpServer {
                 if let Some(remote_paused) = parse_device_state_paused(&frame.payload) {
                     info!("Estado de pausa recibido desde el móvil: paused={}", remote_paused);
                     self.apply_pause_state(remote_paused).await;
+                }
+                false
+            }
+            MessageType::ProfileRevoked => {
+                if authenticated {
+                    let (dev_id, dev_name, mob_id, tr) = {
+                        let st = self.runtime_status.lock().await;
+                        (
+                            st.active_device_id.clone(),
+                            st.device_name.clone().unwrap_or_else(|| "Dispositivo".to_string()),
+                            st.mobile_id.clone(),
+                            st.transport.clone(),
+                        )
+                    };
+                    let parsed = serde_json::from_slice::<serde_json::Value>(&frame.payload).ok();
+                    let req_tr = parsed
+                        .as_ref()
+                        .and_then(|v| v.get("transport").and_then(|t| t.as_str()))
+                        .map(str::to_string)
+                        .or(tr);
+                    let target_info = req_tr.as_deref().and_then(|tr_name| {
+                        self.pairing.find_trusted_device_by_meta(
+                            mob_id.as_deref(),
+                            tr_name,
+                            Some(dev_name.as_str()),
+                        )
+                    });
+                    let _ = self.event_tx.send(IpcEvent::PairingInvalidNotice {
+                        device_id: target_info.as_ref().map(|d| d.device_id.clone()).or(dev_id),
+                        device_name: target_info
+                            .as_ref()
+                            .map(|d| d.device_name.clone())
+                            .unwrap_or(dev_name),
+                        mobile_id: mob_id,
+                        transport: req_tr,
+                        reason: "deleted_on_mobile".to_string(),
+                    });
+                    let is_active_revoked = parsed
+                        .as_ref()
+                        .and_then(|v| v.get("active").and_then(|b| b.as_bool()))
+                        .unwrap_or(true);
+                    if is_active_revoked {
+                        session_cancel.notify_waiters();
+                    }
                 }
                 false
             }

@@ -40,6 +40,13 @@ pub enum IpcCommand {
     RevokeTrustedDevice { device_id: String },
     RenameTrustedDevice { device_id: String, name: String },
     SelectTrustedDevice { device_id: String },
+    SetTcpNetworkConfig {
+        tcp_ip: Option<String>,
+        tcp_port: Option<u16>,
+        reset: bool,
+    },
+    SetAutoAcceptMobileSwitch { enabled: bool },
+    RespondMobileSwitch { request_id: String, accept: bool },
 }
 
 /// Eventos emitidos en tiempo real por el Driver hacia las aplicaciones de escritorio.
@@ -103,7 +110,29 @@ pub enum IpcEvent {
         #[serde(default)]
         driver_build_id: Option<String>,
         #[serde(default)]
+        tcp_ip_override: Option<String>,
+        #[serde(default)]
+        auto_accept_mobile_switch: bool,
+        #[serde(default)]
         trusted_devices: Vec<TrustedDeviceInfo>,
+    },
+    PendingMobileSwitch {
+        request_id: String,
+        device_id: Option<String>,
+        device_name: String,
+        mobile_id: Option<String>,
+        device_os: Option<String>,
+        transport: String,
+    },
+    PendingMobileSwitchCleared {
+        request_id: String,
+    },
+    PairingInvalidNotice {
+        device_id: Option<String>,
+        device_name: String,
+        mobile_id: Option<String>,
+        transport: Option<String>,
+        reason: String,
     },
     PairingTokenIssued {
         method: String,

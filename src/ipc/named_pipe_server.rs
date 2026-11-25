@@ -7,12 +7,11 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use super::events::{IpcCommand, IpcEvent};
-use crate::network::pairing_manager::detect_lan_ipv4;
 use crate::network::{
     get_local_bluetooth_info, BluetoothRfcommServer, BridgeTcpServer, PairingManager, RelayClient,
     UsbAoaHost, WifiDirectServer,
 };
-use crate::protocol::constants::{DEFAULT_TCP_PORT, NAMED_PIPE_NAME};
+use crate::protocol::constants::NAMED_PIPE_NAME;
 
 pub struct NamedPipeIpcServer {
     event_sender: broadcast::Sender<IpcEvent>,
@@ -128,7 +127,10 @@ impl NamedPipeIpcServer {
         let pairing = self.pairing.as_ref()?;
         let bt_info = get_local_bluetooth_info();
         let wfd = self.wifi_direct.as_ref().map(|w| w.current_snapshot());
-        let tcp_ip = detect_lan_ipv4();
+        let tcp_ip = pairing.get_effective_tcp_ip();
+        let tcp_port = pairing.get_tcp_port();
+        let tcp_ip_override = pairing.get_tcp_ip_override();
+        let auto_accept_mobile_switch = pairing.get_auto_accept_mobile_switch();
         let relay_url = pairing.get_relay_url();
         let relay_channel = pairing.get_relay_channel();
         let relay_connected = self
@@ -170,7 +172,7 @@ impl NamedPipeIpcServer {
         Some(IpcEvent::TransportSnapshot {
             pc_name: pairing.pc_name().to_string(),
             tcp_ip,
-            tcp_port: DEFAULT_TCP_PORT,
+            tcp_port,
             bt_available: bt_info.is_some(),
             bt_mac: bt_info.as_ref().map(|(m, _)| m.clone()),
             bt_name: bt_info.map(|(_, n)| n),
@@ -189,6 +191,8 @@ impl NamedPipeIpcServer {
             usb_connected,
             driver_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             driver_build_id: Some(env!("NFC_BRIDGE_BUILD_ID").to_string()),
+            tcp_ip_override,
+            auto_accept_mobile_switch,
             trusted_devices: pairing.list_trusted_devices(),
         })
     }
@@ -346,12 +350,13 @@ impl NamedPipeIpcServer {
                                                         pairing.issue_ephemeral_token_for_method(&method);
                                                     let bt_info = get_local_bluetooth_info();
                                                     let wfd = this.wifi_direct.as_ref().map(|w| w.current_snapshot());
-                                                    let tcp_ip = detect_lan_ipv4();
+                                                    let tcp_ip = pairing.get_effective_tcp_ip();
+                                                    let tcp_port = pairing.get_tcp_port();
                                                     let (uri, share_link) = pairing.build_qr_and_link(
                                                         &method,
                                                         &pair_token,
                                                         tcp_ip.as_deref(),
-                                                        DEFAULT_TCP_PORT,
+                                                        tcp_port,
                                                         bt_info.as_ref().map(|(m, _)| m.as_str()),
                                                         wfd.as_ref().and_then(|w| w.ssid.as_deref()),
                                                         wfd.as_ref().and_then(|w| w.passphrase.as_deref()),
@@ -587,8 +592,8 @@ impl NamedPipeIpcServer {
                                                                     let payload = serde_json::json!({
                                                                         "transport": target_tr,
                                                                         "pc_name": pairing.pc_name(),
-                                                                        "tcp_ip": detect_lan_ipv4(),
-                                                                        "tcp_port": DEFAULT_TCP_PORT,
+                                                                        "tcp_ip": pairing.get_effective_tcp_ip(),
+                                                                        "tcp_port": pairing.get_tcp_port(),
                                                                         "cert": pairing.get_tcp_cert_sha256(),
                                                                         "bt_mac": bt_info.map(|(m, _)| m),
                                                                         "relay_url": pairing.get_relay_url(),
@@ -603,6 +608,12 @@ impl NamedPipeIpcServer {
                                                                         "Solicitando cambio de transporte del móvil activo hacia '{}' ({})",
                                                                         target_tr, device_id
                                                                     );
+                                                                    coord
+                                                                        .mark_approved_sync_switch(
+                                                                            target.mobile_id.clone(),
+                                                                            target_tr.clone(),
+                                                                        )
+                                                                        .await;
                                                                     coord
                                                                         .switch_active_transport(
                                                                             payload,
@@ -625,6 +636,69 @@ impl NamedPipeIpcServer {
                                                     {
                                                         let _ = this.event_sender.send(snapshot);
                                                     }
+                                                }
+                                            }
+                                            IpcCommand::SetTcpNetworkConfig {
+                                                tcp_ip,
+                                                tcp_port,
+                                                reset,
+                                            } => {
+                                                if let Some(ref pairing) = this.pairing {
+                                                    let old_port = pairing.get_tcp_port();
+                                                    let (_, new_port) = pairing.set_tcp_network_config(tcp_ip, tcp_port, reset);
+                                                    if old_port != new_port {
+                                                        #[cfg(windows)]
+                                                        {
+                                                            use std::os::windows::process::CommandExt;
+                                                            let port_str = new_port.to_string();
+                                                            for proto in ["TCP", "UDP"] {
+                                                                let _ = std::process::Command::new("netsh")
+                                                                    .args([
+                                                                        "advfirewall", "firewall", "delete", "rule",
+                                                                        &format!("name=NFC Bridge Driver Custom {}", proto),
+                                                                    ])
+                                                                    .creation_flags(0x0800_0000)
+                                                                    .status();
+                                                                if new_port != 45362 {
+                                                                    let _ = std::process::Command::new("netsh")
+                                                                        .args([
+                                                                            "advfirewall", "firewall", "add", "rule",
+                                                                            &format!("name=NFC Bridge Driver Custom {}", proto),
+                                                                            "dir=in", "action=allow",
+                                                                            &format!("protocol={}", proto),
+                                                                            &format!("localport={}", port_str),
+                                                                            "profile=any",
+                                                                        ])
+                                                                        .creation_flags(0x0800_0000)
+                                                                        .status();
+                                                                }
+                                                            }
+                                                        }
+                                                        if let Some(ref coord) = this.coordinator {
+                                                            coord.trigger_tcp_rebind();
+                                                        }
+                                                    }
+                                                }
+                                                if let Some(snapshot) = this.build_transport_snapshot() {
+                                                    let _ = this.event_sender.send(snapshot);
+                                                }
+                                            }
+                                            IpcCommand::SetAutoAcceptMobileSwitch { enabled } => {
+                                                if let Some(ref pairing) = this.pairing {
+                                                    pairing.set_auto_accept_mobile_switch(enabled);
+                                                }
+                                                if let Some(snapshot) = this.build_transport_snapshot() {
+                                                    let _ = this.event_sender.send(snapshot);
+                                                }
+                                            }
+                                            IpcCommand::RespondMobileSwitch {
+                                                request_id,
+                                                accept,
+                                            } => {
+                                                if let Some(ref coord) = this.coordinator {
+                                                    coord
+                                                        .respond_mobile_switch(&request_id, accept)
+                                                        .await;
                                                 }
                                             }
                                             other_cmd => {
@@ -656,7 +730,10 @@ impl NamedPipeIpcServer {
                                                         | IpcCommand::SetRelayUrl { .. }
                                                         | IpcCommand::RevokeTrustedDevice { .. }
                                                         | IpcCommand::RenameTrustedDevice { .. }
-                                                        | IpcCommand::SelectTrustedDevice { .. } => {}
+                                                        | IpcCommand::SelectTrustedDevice { .. }
+                                                        | IpcCommand::SetTcpNetworkConfig { .. }
+                                                        | IpcCommand::SetAutoAcceptMobileSwitch { .. }
+                                                        | IpcCommand::RespondMobileSwitch { .. } => {}
                                                     }
                                                 }
                                             }

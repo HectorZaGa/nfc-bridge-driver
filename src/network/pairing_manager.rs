@@ -40,6 +40,30 @@ struct RelayConfigFile {
     pub relay_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DriverSettingsFile {
+    #[serde(default)]
+    pub tcp_ip_override: Option<String>,
+    #[serde(default = "default_tcp_port_cfg")]
+    pub tcp_port: u16,
+    #[serde(default)]
+    pub auto_accept_mobile_switch: bool,
+}
+
+fn default_tcp_port_cfg() -> u16 {
+    crate::protocol::constants::DEFAULT_TCP_PORT
+}
+
+impl Default for DriverSettingsFile {
+    fn default() -> Self {
+        Self {
+            tcp_ip_override: None,
+            tcp_port: default_tcp_port_cfg(),
+            auto_accept_mobile_switch: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct HelloSynPayload {
     #[serde(default)]
@@ -97,6 +121,7 @@ pub struct PairingManager {
     relay_host_secret: Mutex<String>,
     relay_url: Mutex<Option<String>>,
     tcp_cert_sha256: Mutex<Option<String>>,
+    driver_settings: Mutex<DriverSettingsFile>,
 }
 
 impl PairingManager {
@@ -113,6 +138,7 @@ impl PairingManager {
         let channel = load_or_create_channel(&data_dir.join("relay_channel.txt"));
         let host_secret = load_or_create_host_secret(&data_dir.join("relay_host_secret.txt"));
         let relay_url = load_relay_url(&data_dir.join("relay_config.json"));
+        let driver_settings = load_driver_settings(&data_dir.join("driver_settings.json"));
 
         Self {
             data_dir,
@@ -123,6 +149,70 @@ impl PairingManager {
             relay_host_secret: Mutex::new(host_secret),
             relay_url: Mutex::new(relay_url),
             tcp_cert_sha256: Mutex::new(None),
+            driver_settings: Mutex::new(driver_settings),
+        }
+    }
+
+    pub fn get_tcp_ip_override(&self) -> Option<String> {
+        self.driver_settings
+            .lock()
+            .ok()
+            .and_then(|s| s.tcp_ip_override.clone())
+    }
+
+    pub fn get_effective_tcp_ip(&self) -> Option<String> {
+        self.get_tcp_ip_override()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(detect_lan_ipv4)
+    }
+
+    pub fn get_tcp_port(&self) -> u16 {
+        self.driver_settings
+            .lock()
+            .ok()
+            .map(|s| s.tcp_port)
+            .filter(|&p| p >= 1024)
+            .unwrap_or_else(default_tcp_port_cfg)
+    }
+
+    pub fn get_auto_accept_mobile_switch(&self) -> bool {
+        self.driver_settings
+            .lock()
+            .ok()
+            .map(|s| s.auto_accept_mobile_switch)
+            .unwrap_or(false)
+    }
+
+    pub fn set_tcp_network_config(
+        &self,
+        tcp_ip: Option<String>,
+        tcp_port: Option<u16>,
+        reset: bool,
+    ) -> (Option<String>, u16) {
+        let path = self.data_dir.join("driver_settings.json");
+        let Ok(mut st) = self.driver_settings.lock() else {
+            return (None, default_tcp_port_cfg());
+        };
+        if reset {
+            st.tcp_ip_override = None;
+            st.tcp_port = default_tcp_port_cfg();
+        } else {
+            st.tcp_ip_override = tcp_ip
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && s.parse::<std::net::Ipv4Addr>().is_ok());
+            if let Some(p) = tcp_port.filter(|&p| p >= 1024) {
+                st.tcp_port = p;
+            }
+        }
+        save_driver_settings(&path, &st);
+        (st.tcp_ip_override.clone(), st.tcp_port)
+    }
+
+    pub fn set_auto_accept_mobile_switch(&self, enabled: bool) {
+        let path = self.data_dir.join("driver_settings.json");
+        if let Ok(mut st) = self.driver_settings.lock() {
+            st.auto_accept_mobile_switch = enabled;
+            save_driver_settings(&path, &st);
         }
     }
 
@@ -413,6 +503,22 @@ impl PairingManager {
                 transport,
             }
         } else if let Some(ref label) = clean_name {
+            let orphaned_existing = if transport != "usb" {
+                self.find_trusted_device_by_meta(mobile_id.as_deref(), &transport, Some(label))
+            } else {
+                None
+            };
+            if orphaned_existing.is_some() {
+                return HelloAuthResult {
+                    outcome: HelloAuthOutcome::Rejected {
+                        reason: "pairing_credentials_missing".to_string(),
+                    },
+                    device_id: orphaned_existing.map(|d| d.device_id),
+                    mobile_id,
+                    device_os,
+                    transport,
+                };
+            }
             let (permanent, effective_name) = self.upsert_trusted_device(
                 label,
                 mobile_id.clone(),
@@ -471,6 +577,29 @@ impl PairingManager {
         self.list_trusted_devices()
             .into_iter()
             .find(|d| d.device_id == device_id)
+    }
+
+    pub fn find_trusted_device_by_meta(
+        &self,
+        mobile_id: Option<&str>,
+        transport: &str,
+        device_name: Option<&str>,
+    ) -> Option<TrustedDeviceInfo> {
+        let list = self.list_trusted_devices();
+        list.into_iter().find(|d| {
+            let same_tr = d
+                .transport
+                .as_deref()
+                .map(|t| t == transport)
+                .unwrap_or(false);
+            if !same_tr {
+                return false;
+            }
+            if let (Some(mid_a), Some(mid_b)) = (d.mobile_id.as_deref(), mobile_id) {
+                return mid_a.eq_ignore_ascii_case(mid_b);
+            }
+            device_name.is_some_and(|n| d.device_name.eq_ignore_ascii_case(n))
+        })
     }
 
     pub fn rename_trusted_device(&self, device_id: &str, new_name: &str) -> Option<String> {
@@ -1149,6 +1278,22 @@ fn load_or_create_host_secret(path: &PathBuf) -> String {
     }
     let _ = std::fs::write(path, &secret);
     secret
+}
+
+fn load_driver_settings(path: &PathBuf) -> DriverSettingsFile {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<DriverSettingsFile>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_driver_settings(path: &PathBuf, cfg: &DriverSettingsFile) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(cfg) {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 const BUILTIN_DEFAULT_RELAY_URL: &str = "https://nfc-bridge.hectorzaga96.workers.dev";
