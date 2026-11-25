@@ -7,7 +7,7 @@
 //! como Servicio de Windows (services.msc).
 
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Notify};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -79,13 +79,26 @@ fn handle_cli_commands() -> Option<anyhow::Result<()>> {
     }
 
     match args[1].as_str() {
+        "--service" => {
+            #[cfg(windows)]
+            {
+                return Some(
+                    windows_svc::run()
+                        .map_err(|e| anyhow::anyhow!("Error en servicio NfcBridgeDriver: {}", e)),
+                );
+            }
+            #[cfg(not(windows))]
+            {
+                None
+            }
+        }
         "--install-service" => {
             if let Err(e) = install_embedded_usbdk(true) {
                 return Some(Err(anyhow::anyhow!("No se pudo instalar UsbDk embebido: {}", e)));
             }
 
             let exe_path = std::env::current_exe().unwrap_or_default();
-            let bin_path = format!("\"{}\"", exe_path.to_string_lossy());
+            let bin_path = format!("\"{}\" --service", exe_path.to_string_lossy());
             let bin_arg = format!("binPath={}", bin_path);
 
             let service_exists = run_hidden_command("sc.exe", &["query", "NfcBridgeDriver"])
@@ -119,8 +132,15 @@ fn handle_cli_commands() -> Option<anyhow::Result<()>> {
 
             match status {
                 Ok(s) if s.success() => {
-                    let _ = run_hidden_command("sc.exe", &["start", "NfcBridgeDriver"]);
-                    Some(Ok(()))
+                    let start_status = run_hidden_command("sc.exe", &["start", "NfcBridgeDriver"]);
+                    match start_status {
+                        Ok(st) if st.success() => Some(Ok(())),
+                        Ok(st) => Some(Err(anyhow::anyhow!(
+                            "sc.exe start NfcBridgeDriver falló con código: {:?}",
+                            st.code()
+                        ))),
+                        Err(e) => Some(Err(anyhow::anyhow!("No se pudo iniciar el servicio: {}", e))),
+                    }
                 }
                 Ok(s) => Some(Err(anyhow::anyhow!(
                     "sc.exe {} falló con código: {:?}",
@@ -152,19 +172,42 @@ fn handle_cli_commands() -> Option<anyhow::Result<()>> {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    if let Some(result) = handle_cli_commands() {
-        return result;
-    }
-
-    // Configuración de Logging
+fn init_logging(to_programdata_file: bool) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,nfc_bridge_driver=debug"));
+
+    if to_programdata_file {
+        let log_dir = std::path::PathBuf::from(
+            std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string()),
+        )
+        .join("NFC Bridge");
+        if std::fs::create_dir_all(&log_dir).is_ok() {
+            let log_path = log_dir.join("driver.log");
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(log_path)
+            {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_target(false)
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(file))
+                    .try_init();
+                return;
+            }
+        }
+    }
+
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .try_init();
+}
+
+async fn run_driver(shutdown: Option<Arc<Notify>>, log_to_file: bool) -> anyhow::Result<()> {
+    init_logging(log_to_file);
 
     info!("============================================================");
     info!("    NFC BRIDGE DRIVER (Windows Silent Background Service)   ");
@@ -208,9 +251,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         let transceive_cb = move |req: Vec<u8>| {
             let tcp = Arc::clone(&tcp_server_for_usbip);
-            async move {
-                tcp.transceive(req).await
-            }
+            async move { tcp.transceive(req).await }
         };
 
         if let Err(e) = usbip_server.start(transceive_cb).await {
@@ -220,8 +261,95 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Driver activo en segundo plano: Named Pipe (\\\\.\\pipe\\nfc_bridge_driver) listo.");
 
-    tokio::signal::ctrl_c().await?;
-    info!("Señal de apagado recibida. Cerrando NFC Bridge Driver...");
+    if let Some(notify) = shutdown {
+        notify.notified().await;
+    } else {
+        tokio::signal::ctrl_c().await?;
+    }
 
+    info!("Señal de apagado recibida. Cerrando NFC Bridge Driver...");
     Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    if let Some(result) = handle_cli_commands() {
+        return result;
+    }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(run_driver(None, false))
+}
+
+#[cfg(windows)]
+mod windows_svc {
+    use std::ffi::OsString;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    use windows_service::{
+        define_windows_service,
+        service::{
+            ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+            ServiceType,
+        },
+        service_control_handler::{self, ServiceControlHandlerResult},
+        service_dispatcher,
+    };
+
+    const SERVICE_NAME: &str = "NfcBridgeDriver";
+    const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+
+    define_windows_service!(ffi_service_main, service_main);
+
+    pub fn run() -> windows_service::Result<()> {
+        service_dispatcher::start(SERVICE_NAME, ffi_service_main)
+    }
+
+    fn service_main(_arguments: Vec<OsString>) {
+        let _ = run_service();
+    }
+
+    fn run_service() -> windows_service::Result<()> {
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_signal = Arc::clone(&shutdown);
+
+        let event_handler = move |control_event| -> ServiceControlHandlerResult {
+            match control_event {
+                ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                ServiceControl::Stop | ServiceControl::Shutdown => {
+                    shutdown_signal.notify_waiters();
+                    ServiceControlHandlerResult::NoError
+                }
+                _ => ServiceControlHandlerResult::NotImplemented,
+            }
+        };
+
+        let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
+
+        status_handle.set_service_status(ServiceStatus {
+            service_type: SERVICE_TYPE,
+            current_state: ServiceState::Running,
+            controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        })?;
+
+        if let Ok(rt) = tokio::runtime::Runtime::new() {
+            let _ = rt.block_on(super::run_driver(Some(shutdown), true));
+        }
+
+        let _ = status_handle.set_service_status(ServiceStatus {
+            service_type: SERVICE_TYPE,
+            current_state: ServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        });
+
+        Ok(())
+    }
 }

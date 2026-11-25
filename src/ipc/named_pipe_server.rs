@@ -15,6 +15,58 @@ pub struct NamedPipeIpcServer {
     coordinator: Option<Arc<BridgeTcpServer>>,
 }
 
+#[cfg(windows)]
+fn create_pipe_instance(
+    first: bool,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+
+    // Permite control total a SYSTEM/Administrators y Lectura+Escritura IPC a usuarios autenticados (Sync/Tools sin UAC).
+    let sddl: Vec<u16> = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)\0"
+        .encode_utf16()
+        .collect();
+    const SDDL_REVISION_1: u32 = 1;
+
+    let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd,
+            null_mut(),
+        )
+    };
+
+    if ok != 0 && !sd.is_null() {
+        let mut sa = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd,
+            bInheritHandle: 0,
+        };
+        let result = unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(first)
+                .create_with_security_attributes_raw(
+                    NAMED_PIPE_NAME,
+                    (&mut sa as *mut SECURITY_ATTRIBUTES).cast::<c_void>(),
+                )
+        };
+        unsafe {
+            LocalFree(sd as HLOCAL);
+        }
+        return result;
+    }
+
+    ServerOptions::new()
+        .first_pipe_instance(first)
+        .create(NAMED_PIPE_NAME)
+}
+
 impl NamedPipeIpcServer {
     pub fn new(event_sender: broadcast::Sender<IpcEvent>) -> Self {
         Self {
@@ -39,10 +91,7 @@ impl NamedPipeIpcServer {
 
         let mut first = true;
         loop {
-            let server = match ServerOptions::new()
-                .first_pipe_instance(first)
-                .create(NAMED_PIPE_NAME)
-            {
+            let server = match create_pipe_instance(first) {
                 Ok(s) => {
                     first = false;
                     s

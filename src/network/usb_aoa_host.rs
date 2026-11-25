@@ -71,20 +71,33 @@ impl UsbAoaHost {
     fn init_usb_backend(warn_if_missing_usbdk: bool) -> anyhow::Result<UsbBackend> {
         #[cfg(windows)]
         {
-            if let Ok(usbdk_ctx) = Context::with_options(&[rusb::UsbOption::use_usbdk()]) {
-                if usbdk_ctx.devices().is_ok() {
-                    info!("Backend USB AOA activo con UsbDk (MTP/Charging compatible sin ADB).");
-                    return Ok(UsbBackend {
-                        ctx: usbdk_ctx,
-                        using_usbdk: true,
-                    });
+            match Context::with_options(&[rusb::UsbOption::use_usbdk()]) {
+                Ok(usbdk_ctx) => match usbdk_ctx.devices() {
+                    Ok(_) => {
+                        info!("Backend USB AOA activo con UsbDk (MTP/Charging compatible sin ADB).");
+                        return Ok(UsbBackend {
+                            ctx: usbdk_ctx,
+                            using_usbdk: true,
+                        });
+                    }
+                    Err(e) => {
+                        if warn_if_missing_usbdk {
+                            warn!(
+                                "UsbDk se activó pero falló al enumerar dispositivos ({}). Usando backend WinUSB...",
+                                e
+                            );
+                        }
+                    }
+                },
+                Err(e) => {
+                    if warn_if_missing_usbdk {
+                        warn!(
+                            "UsbDk no está disponible o activo ({}); usando backend WinUSB estándar. \
+                             Para USB AOA puro con dispositivos MTP/Xiaomi/Samsung instala UsbDk (`daynix.UsbDk`).",
+                            e
+                        );
+                    }
                 }
-            }
-            if warn_if_missing_usbdk {
-                warn!(
-                    "UsbDk no está instalado o activo en Windows; usando backend WinUSB estándar. \
-                     Para USB AOA puro con dispositivos MTP/Xiaomi/Samsung instala UsbDk (`daynix.UsbDk`)."
-                );
             }
         }
 
