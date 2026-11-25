@@ -233,7 +233,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_driver(None, false))
+    let result = rt.block_on(run_driver(None, false));
+    rt.shutdown_timeout(std::time::Duration::from_millis(250));
+    result
 }
 
 #[cfg(windows)]
@@ -294,6 +296,7 @@ mod windows_svc {
 
         if let Ok(rt) = tokio::runtime::Runtime::new() {
             let _ = rt.block_on(super::run_driver(Some(shutdown), true));
+            rt.shutdown_timeout(Duration::from_millis(250));
         }
 
         let _ = status_handle.set_service_status(ServiceStatus {
