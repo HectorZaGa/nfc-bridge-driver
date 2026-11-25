@@ -705,10 +705,11 @@ impl PairingManager {
                 let base = self.get_relay_url().unwrap_or_default();
                 let ws_base = to_ws_base(&base);
                 let http_base = to_http_base(&base);
-                let envelope = encrypt_relay_envelope(&channel, &self.pc_name, &ws_base, pair_token);
-                let uri = format!("nfcbridge://relay?d={}", percent_encode_query(&envelope));
+                let qr_envelope = encrypt_relay_envelope(&channel, &self.pc_name, &ws_base, pair_token);
+                let uri = format!("nfcbridge://relay?d={}", percent_encode_query(&qr_envelope));
                 let share = if !http_base.is_empty() {
-                    Some(format!("{}/connect?d={}", http_base, percent_encode_query(&envelope)))
+                    let link_envelope = encrypt_relay_envelope(&channel, &self.pc_name, "", pair_token);
+                    Some(format!("{}/c?d={}", http_base, percent_encode_query(&link_envelope)))
                 } else {
                     None
                 };
@@ -819,19 +820,53 @@ fn relay_envelope_key() -> LessSafeKey {
     LessSafeKey::new(unbound)
 }
 
+fn encode_hex_if_prefixed(input: &str, prefix: &str) -> Option<Vec<u8>> {
+    let rest = input.strip_prefix(prefix)?;
+    if rest.is_empty() || rest.len() % 2 != 0 || rest.len() > 64 {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)? as u8;
+        let lo = (pair[1] as char).to_digit(16)? as u8;
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
+fn push_len_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let capped = bytes.len().min(u8::MAX as usize);
+    buf.push(capped as u8);
+    buf.extend_from_slice(&bytes[..capped]);
+}
+
 pub fn encrypt_relay_envelope(
     channel: &str,
     pc_name: &str,
     relay_ws: &str,
     pair_token: &str,
 ) -> String {
-    let json = serde_json::json!({
-        "c": channel,
-        "n": pc_name,
-        "r": relay_ws,
-        "p": pair_token,
-    })
-    .to_string();
+    let mut flags = 0u8;
+    let ch_bytes = if let Some(raw) = encode_hex_if_prefixed(channel, "nb-") {
+        flags |= 0x01;
+        raw
+    } else {
+        channel.as_bytes().to_vec()
+    };
+    let pair_bytes = if let Some(raw) = encode_hex_if_prefixed(pair_token, "PAIR-") {
+        flags |= 0x02;
+        raw
+    } else {
+        pair_token.as_bytes().to_vec()
+    };
+
+    let mut plain = Vec::with_capacity(1 + 4 + ch_bytes.len() + pair_bytes.len() + pc_name.len() + relay_ws.len());
+    plain.push(flags);
+    push_len_bytes(&mut plain, &ch_bytes);
+    push_len_bytes(&mut plain, &pair_bytes);
+    push_len_bytes(&mut plain, pc_name.as_bytes());
+    push_len_bytes(&mut plain, relay_ws.as_bytes());
 
     let mut nonce_bytes = [0u8; 12];
     if getrandom::getrandom(&mut nonce_bytes).is_err() {
@@ -841,17 +876,73 @@ pub fn encrypt_relay_envelope(
 
     let key = relay_envelope_key();
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
-    let mut buffer = json.into_bytes();
-    let _ = key.seal_in_place_append_tag(nonce, Aad::from(RELAY_ENVELOPE_AAD), &mut buffer);
+    let _ = key.seal_in_place_append_tag(nonce, Aad::from(RELAY_ENVELOPE_AAD), &mut plain);
 
-    let mut combined = Vec::with_capacity(12 + buffer.len());
+    let mut combined = Vec::with_capacity(12 + plain.len());
     combined.extend_from_slice(&nonce_bytes);
-    combined.extend_from_slice(&buffer);
-    format!("v1.{}", base64url_encode_nopad(&combined))
+    combined.extend_from_slice(&plain);
+    format!("v2.{}", base64url_encode_nopad(&combined))
+}
+
+#[cfg(test)]
+fn read_len_bytes<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+    let len = *data.get(*pos)? as usize;
+    *pos += 1;
+    let end = pos.checked_add(len)?;
+    let slice = data.get(*pos..end)?;
+    *pos = end;
+    Some(slice)
 }
 
 #[cfg(test)]
 fn decrypt_relay_envelope(encoded: &str) -> Option<(String, String, String, String)> {
+    if let Some(body) = encoded.strip_prefix("v2.") {
+        let raw = base64url_decode_nopad(body)?;
+        if raw.len() <= 12 {
+            return None;
+        }
+        let (nonce_slice, cipher_slice) = raw.split_at(12);
+        let nonce_arr: [u8; 12] = nonce_slice.try_into().ok()?;
+        let key = relay_envelope_key();
+        let mut buf = cipher_slice.to_vec();
+        let plain = key
+            .open_in_place(
+                Nonce::assume_unique_for_key(nonce_arr),
+                Aad::from(RELAY_ENVELOPE_AAD),
+                &mut buf,
+            )
+            .ok()?;
+        let mut pos = 0usize;
+        let flags = *plain.get(pos)?;
+        pos += 1;
+        let ch_raw = read_len_bytes(plain, &mut pos)?;
+        let pair_raw = read_len_bytes(plain, &mut pos)?;
+        let name_raw = read_len_bytes(plain, &mut pos)?;
+        let relay_raw = read_len_bytes(plain, &mut pos)?;
+
+        let channel = if (flags & 0x01) != 0 {
+            let mut s = String::from("nb-");
+            for b in ch_raw {
+                s.push_str(&format!("{:02x}", b));
+            }
+            s
+        } else {
+            String::from_utf8(ch_raw.to_vec()).ok()?
+        };
+        let pair_token = if (flags & 0x02) != 0 {
+            let mut s = String::from("PAIR-");
+            for b in pair_raw {
+                s.push_str(&format!("{:02X}", b));
+            }
+            s
+        } else {
+            String::from_utf8(pair_raw.to_vec()).ok()?
+        };
+        let pc_name = String::from_utf8(name_raw.to_vec()).ok()?;
+        let relay_ws = String::from_utf8(relay_raw.to_vec()).ok()?;
+        return Some((channel, pc_name, relay_ws, pair_token));
+    }
+
     let body = encoded.strip_prefix("v1.")?;
     let raw = base64url_decode_nopad(body)?;
     if raw.len() <= 12 {
@@ -1149,20 +1240,28 @@ mod tests {
             None,
             None,
         );
-        assert!(uri.starts_with("nfcbridge://relay?d=v1."));
+        assert!(uri.starts_with("nfcbridge://relay?d=v2."));
         assert!(!uri.contains("channel="));
         assert!(!uri.contains("PAIR-1234"));
         let link = share.expect("share link expected when relay URL set");
-        assert!(link.starts_with("https://nfc-relay.example.workers.dev/connect?d=v1."));
+        assert!(link.starts_with("https://nfc-relay.example.workers.dev/c?d=v2."));
         assert!(!link.contains("channel="));
         assert!(!link.contains("PAIR-1234"));
 
         let d_enc = uri.strip_prefix("nfcbridge://relay?d=").unwrap();
         let d_raw = d_enc.replace("%2D", "-").replace("%5F", "_").replace("%2E", ".");
-        let (c, n, r, p) = decrypt_relay_envelope(&d_raw).expect("decrypt envelope");
+        let (c, n, r, p) = decrypt_relay_envelope(&d_raw).expect("decrypt qr envelope");
         assert!(c.starts_with("nb-"));
         assert_eq!(n, "PC ONE");
         assert_eq!(r, "wss://nfc-relay.example.workers.dev");
+        assert_eq!(p, "PAIR-1234");
+
+        let link_d = link.strip_prefix("https://nfc-relay.example.workers.dev/c?d=").unwrap();
+        let (lc, ln, lr, lp) = decrypt_relay_envelope(link_d).expect("decrypt short share envelope");
+        assert_eq!(lc, c);
+        assert_eq!(ln, "PC ONE");
+        assert_eq!(lr, "");
+        assert_eq!(lp, "PAIR-1234");
         assert_eq!(p, "PAIR-1234");
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -125,7 +125,7 @@ export default {
       return stub.fetch(request);
     }
 
-    if (url.pathname === "/connect" || url.pathname === "/pair") {
+    if (url.pathname === "/c" || url.pathname === "/connect" || url.pathname === "/pair") {
       const deepLink = buildDeepLink(url);
       return new Response(renderLandingHtml(deepLink), {
         headers: {

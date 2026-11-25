@@ -742,7 +742,18 @@ impl BridgeTcpServer {
                 if let Some(tag) = FrameCodec::decode_tag_attached(&frame.payload) {
                     let uid_hex = tag.uid_hex();
                     let is_ntag215 = tag.is_mifare_ultralight();
-                    info!("ETIQUETA NFC DETECTADA: UID={} (NTAG215={})", uid_hex, is_ntag215);
+                    let tag_type = if is_ntag215 {
+                        "NTAG / Ultralight (ISO 14443-3A)"
+                    } else if tag.is_iso_dep() {
+                        "ISO-DEP / Tarjeta inteligente (ISO 14443-4)"
+                    } else if tag.sak == 0x08 || tag.sak == 0x18 {
+                        "MIFARE Classic (ISO 14443-3A)"
+                    } else if tag.is_nfc_a() {
+                        "ISO 14443-3A (NfcA)"
+                    } else {
+                        "Etiqueta NFC"
+                    };
+                    info!("Etiqueta NFC detectada: {}", tag_type);
 
                     {
                         let mut st = self.runtime_status.lock().await;
