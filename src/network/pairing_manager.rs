@@ -9,6 +9,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
+use crate::ipc::events::TrustedDeviceInfo;
+
 const DEFAULT_PAIR_TTL_SECS: u64 = 90;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +33,8 @@ struct HelloSynPayload {
     pair_token: Option<String>,
     #[serde(default)]
     device_token: Option<String>,
+    #[serde(default)]
+    paused: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +267,29 @@ impl PairingManager {
         }
     }
 
+    pub fn list_trusted_devices(&self) -> Vec<TrustedDeviceInfo> {
+        let Ok(list) = self.trusted_devices.lock() else {
+            return Vec::new();
+        };
+        list.iter()
+            .map(|d| TrustedDeviceInfo {
+                device_id: device_public_id(&d.device_token),
+                device_name: d.device_name.clone(),
+                created_unix: d.created_unix,
+            })
+            .collect()
+    }
+
+    pub fn revoke_trusted_device(&self, device_id: &str) -> Option<String> {
+        let mut list = self.trusted_devices.lock().ok()?;
+        let pos = list
+            .iter()
+            .position(|d| device_public_id(&d.device_token) == device_id)?;
+        let removed = list.remove(pos);
+        save_trusted_devices(&self.data_dir.join("trusted_devices.json"), &list);
+        Some(removed.device_name)
+    }
+
     pub fn build_qr_and_link(
         &self,
         method: &str,
@@ -335,6 +362,25 @@ impl PairingManager {
             }
         }
     }
+}
+
+pub fn device_public_id(token: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in token.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("dev-{:012x}", hash & 0x0000_FFFF_FFFF_FFFF)
+}
+
+pub fn parse_hello_paused(payload: &[u8]) -> bool {
+    if payload.is_empty() {
+        return false;
+    }
+    serde_json::from_slice::<HelloSynPayload>(payload)
+        .ok()
+        .and_then(|p| p.paused)
+        .unwrap_or(false)
 }
 
 pub fn detect_lan_ipv4() -> Option<String> {
@@ -593,6 +639,33 @@ mod tests {
 
         let rejected = mgr.validate_hello_payload_for_transport(b"", true);
         assert!(matches!(rejected, HelloAuthOutcome::Rejected { .. }));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_and_revoke_trusted_devices_without_leaking_token() {
+        let dir = temp_dir("trusted_list");
+        let mgr = PairingManager::with_data_dir(dir.clone(), "HECTOR-MASTER".to_string());
+        let (tok, _) = mgr.issue_ephemeral_token();
+        let syn = format!(
+            r#"{{"device_name":"HectorZaGa","pair_token":"{}","paused":true}}"#,
+            tok
+        );
+        assert!(parse_hello_paused(syn.as_bytes()));
+        assert!(matches!(
+            mgr.validate_hello_payload(syn.as_bytes()),
+            HelloAuthOutcome::Paired { .. }
+        ));
+
+        let listed = mgr.list_trusted_devices();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].device_name, "HectorZaGa");
+        assert!(listed[0].device_id.starts_with("dev-"));
+
+        let removed = mgr.revoke_trusted_device(&listed[0].device_id);
+        assert_eq!(removed.as_deref(), Some("HectorZaGa"));
+        assert!(mgr.list_trusted_devices().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -142,6 +142,7 @@ impl NamedPipeIpcServer {
             wfd_ip: wfd.and_then(|w| w.ip),
             driver_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             driver_build_id: Some(env!("NFC_BRIDGE_BUILD_ID").to_string()),
+            trusted_devices: pairing.list_trusted_devices(),
         })
     }
 
@@ -277,6 +278,29 @@ impl NamedPipeIpcServer {
                                                     let _ = this.event_sender.send(snapshot);
                                                 }
                                             }
+                                            IpcCommand::RevokeTrustedDevice { device_id } => {
+                                                let removed = this
+                                                    .pairing
+                                                    .as_ref()
+                                                    .and_then(|p| p.revoke_trusted_device(&device_id));
+                                                if let Some(removed_name) = removed {
+                                                    if let Some(ref coord) = this.coordinator {
+                                                        if let IpcEvent::Status {
+                                                            connected: true,
+                                                            device_name: Some(active_name),
+                                                            ..
+                                                        } = coord.get_status_event().await
+                                                        {
+                                                            if active_name == removed_name {
+                                                                coord.disconnect_active().await;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if let Some(snapshot) = this.build_transport_snapshot() {
+                                                    let _ = this.event_sender.send(snapshot);
+                                                }
+                                            }
                                             other_cmd => {
                                                 if let Some(ref coord) = this.coordinator {
                                                     match other_cmd {
@@ -299,7 +323,8 @@ impl NamedPipeIpcServer {
                                                         | IpcCommand::GetWifiDirectInfo
                                                         | IpcCommand::GetTransportSnapshot
                                                         | IpcCommand::IssuePairingToken { .. }
-                                                        | IpcCommand::SetRelayUrl { .. } => {}
+                                                        | IpcCommand::SetRelayUrl { .. }
+                                                        | IpcCommand::RevokeTrustedDevice { .. } => {}
                                                     }
                                                 }
                                             }

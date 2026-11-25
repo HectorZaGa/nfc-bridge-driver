@@ -2,6 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrustedDeviceInfo {
+    pub device_id: String,
+    pub device_name: String,
+    pub created_unix: u64,
+}
+
 /// Comandos que las aplicaciones de escritorio pueden enviar al Driver.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", content = "params")]
@@ -14,6 +21,7 @@ pub enum IpcCommand {
     SetPaused { paused: bool },
     SetUsbPriority { enabled: bool },
     DisconnectDevice,
+    RevokeTrustedDevice { device_id: String },
 }
 
 /// Eventos emitidos en tiempo real por el Driver hacia las aplicaciones de escritorio.
@@ -56,6 +64,8 @@ pub enum IpcEvent {
         driver_version: Option<String>,
         #[serde(default)]
         driver_build_id: Option<String>,
+        #[serde(default)]
+        trusted_devices: Vec<TrustedDeviceInfo>,
     },
     PairingTokenIssued {
         method: String,

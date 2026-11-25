@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::emulator::CcidHandler;
 use crate::ipc::events::IpcEvent;
-use crate::network::pairing_manager::{HelloAuthOutcome, PairingManager};
+use crate::network::pairing_manager::{parse_hello_paused, HelloAuthOutcome, PairingManager};
 use crate::protocol::codec::{FrameCodec, StreamFrameDecoder};
 use crate::protocol::constants::DEFAULT_TCP_PORT;
 use crate::protocol::crc::compute_crc16;
@@ -82,7 +82,7 @@ impl BridgeTcpServer {
         }
     }
 
-    pub async fn set_paused(&self, paused: bool) {
+    async fn apply_pause_state(&self, paused: bool) {
         self.is_paused.store(paused, Ordering::Relaxed);
         {
             let mut st = self.runtime_status.lock().await;
@@ -100,7 +100,32 @@ impl BridgeTcpServer {
         let _ = self.event_tx.send(status_evt);
     }
 
+    pub async fn set_paused(&self, paused: bool) {
+        self.apply_pause_state(paused).await;
+        let client_tx = {
+            let guard = self.active_client_tx.lock().await;
+            guard.clone()
+        };
+        if let Some(tx) = client_tx {
+            let seq = self.sequence_counter.fetch_add(1, Ordering::SeqCst);
+            let payload = serde_json::json!({ "paused": paused }).to_string();
+            let frame = NfcBridgeFrame::new(MessageType::DeviceState, seq, payload.into_bytes());
+            let _ = tx.send(frame).await;
+        }
+    }
+
     pub async fn disconnect_active(&self) {
+        let client_tx = {
+            let guard = self.active_client_tx.lock().await;
+            guard.clone()
+        };
+        if let Some(tx) = client_tx {
+            let seq = self.sequence_counter.fetch_add(1, Ordering::SeqCst);
+            let payload = br#"{"reason":"manual_disconnect"}"#.to_vec();
+            let frame = NfcBridgeFrame::new(MessageType::Disconnect, seq, payload);
+            let _ = tx.send(frame).await;
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
         self.disconnect_notify.notify_waiters();
     }
 
@@ -343,6 +368,7 @@ impl BridgeTcpServer {
         write_task.abort();
 
         if authenticated {
+            self.is_paused.store(false, Ordering::Relaxed);
             {
                 let mut active = self.active_client_tx.lock().await;
                 *active = None;
@@ -352,6 +378,7 @@ impl BridgeTcpServer {
                 st.connected = false;
                 st.device_name = None;
                 st.endpoint = None;
+                st.paused = false;
                 st.tag_present = false;
                 st.tag_uid = None;
             }
@@ -361,6 +388,8 @@ impl BridgeTcpServer {
             }
 
             let _ = self.event_tx.send(IpcEvent::DeviceDisconnected);
+            let status_evt = self.get_status_event().await;
+            let _ = self.event_tx.send(status_evt);
         }
     }
 
@@ -376,6 +405,7 @@ impl BridgeTcpServer {
         match frame.message_type {
             MessageType::HelloSyn => {
                 let pc_name = self.pairing.pc_name().to_string();
+                let phone_paused = parse_hello_paused(&frame.payload);
                 let outcome = self
                     .pairing
                     .validate_hello_payload_for_transport(&frame.payload, require_token);
@@ -406,56 +436,31 @@ impl BridgeTcpServer {
                         new_device_token,
                     } => {
                         info!("Handshake HELLO_SYN emparejado con QR/Link (nuevo device_token emitido)");
-                        let name = device_name.unwrap_or_else(|| "Android Phone".to_string());
-                        {
-                            let mut st = self.runtime_status.lock().await;
-                            st.connected = true;
-                            st.device_name = Some(name.clone());
-                            st.endpoint = Some(peer_endpoint.to_string());
-                        }
-                        let _ = self.event_tx.send(IpcEvent::DeviceConnected {
-                            device_name: name,
-                            endpoint: peer_endpoint.to_string(),
-                        });
-                        let payload = serde_json::json!({
-                            "pc_name": pc_name,
-                            "status": "ready",
-                            "device_token": new_device_token
-                        })
-                        .to_string();
-                        let ack_frame = NfcBridgeFrame::new(
-                            MessageType::HelloAck,
+                        self.accept_hello_session(
+                            device_name,
+                            Some(new_device_token),
+                            phone_paused,
+                            &pc_name,
+                            peer_endpoint,
                             frame.sequence_id,
-                            payload.into_bytes(),
-                        );
-                        let _ = out_tx.send(ack_frame).await;
+                            out_tx,
+                        )
+                        .await;
                         true
                     }
                     HelloAuthOutcome::Trusted { device_name }
                     | HelloAuthOutcome::LegacyAllowed { device_name } => {
                         info!("Handshake HELLO_SYN recibido del móvil. Respondiendo HELLO_ACK...");
-                        let name = device_name.unwrap_or_else(|| "Android Phone".to_string());
-                        {
-                            let mut st = self.runtime_status.lock().await;
-                            st.connected = true;
-                            st.device_name = Some(name.clone());
-                            st.endpoint = Some(peer_endpoint.to_string());
-                        }
-                        let _ = self.event_tx.send(IpcEvent::DeviceConnected {
-                            device_name: name,
-                            endpoint: peer_endpoint.to_string(),
-                        });
-                        let payload = serde_json::json!({
-                            "pc_name": pc_name,
-                            "status": "ready"
-                        })
-                        .to_string();
-                        let ack_frame = NfcBridgeFrame::new(
-                            MessageType::HelloAck,
+                        self.accept_hello_session(
+                            device_name,
+                            None,
+                            phone_paused,
+                            &pc_name,
+                            peer_endpoint,
                             frame.sequence_id,
-                            payload.into_bytes(),
-                        );
-                        let _ = out_tx.send(ack_frame).await;
+                            out_tx,
+                        )
+                        .await;
                         true
                     }
                 }
@@ -530,10 +535,78 @@ impl BridgeTcpServer {
                 false
             }
             MessageType::HeartbeatAck => false,
+            MessageType::DeviceState => {
+                if !authenticated {
+                    return false;
+                }
+                if let Some(remote_paused) = parse_device_state_paused(&frame.payload) {
+                    info!("Estado de pausa recibido desde el móvil: paused={}", remote_paused);
+                    self.apply_pause_state(remote_paused).await;
+                }
+                false
+            }
+            MessageType::Disconnect => {
+                if authenticated {
+                    info!("Móvil solicitó desconexión limpia ({})", peer_endpoint);
+                    session_cancel.notify_waiters();
+                }
+                false
+            }
             _ => {
                 info!("Trama recibida: tipo={:?}, seq={}", frame.message_type, frame.sequence_id);
                 false
             }
         }
     }
+
+    async fn accept_hello_session(
+        &self,
+        device_name: Option<String>,
+        new_device_token: Option<String>,
+        phone_paused: bool,
+        pc_name: &str,
+        peer_endpoint: &str,
+        sequence_id: u16,
+        out_tx: &mpsc::Sender<NfcBridgeFrame>,
+    ) {
+        let name = device_name.unwrap_or_else(|| "Android Phone".to_string());
+        {
+            let mut st = self.runtime_status.lock().await;
+            st.connected = true;
+            st.device_name = Some(name.clone());
+            st.endpoint = Some(peer_endpoint.to_string());
+        }
+        self.apply_pause_state(phone_paused).await;
+        let _ = self.event_tx.send(IpcEvent::DeviceConnected {
+            device_name: name,
+            endpoint: peer_endpoint.to_string(),
+        });
+        let mut ack_obj = serde_json::json!({
+            "pc_name": pc_name,
+            "status": "ready",
+            "paused": phone_paused
+        });
+        if let (Some(tok), Some(map)) = (new_device_token, ack_obj.as_object_mut()) {
+            map.insert("device_token".to_string(), serde_json::Value::String(tok));
+        }
+        let ack_frame = NfcBridgeFrame::new(
+            MessageType::HelloAck,
+            sequence_id,
+            ack_obj.to_string().into_bytes(),
+        );
+        let _ = out_tx.send(ack_frame).await;
+    }
+}
+
+fn parse_device_state_paused(payload: &[u8]) -> Option<bool> {
+    if payload.len() == 1 && (payload[0] == 0 || payload[0] == 1) {
+        return Some(payload[0] == 1);
+    }
+    #[derive(serde::Deserialize)]
+    struct DeviceStateJson {
+        paused: Option<bool>,
+    }
+    serde_json::from_slice::<DeviceStateJson>(payload)
+        .ok()
+        .and_then(|s| s.paused)
 }
