@@ -140,6 +140,8 @@ impl NamedPipeIpcServer {
             wfd_ssid: wfd.as_ref().and_then(|w| w.ssid.clone()),
             wfd_passphrase: wfd.as_ref().and_then(|w| w.passphrase.clone()),
             wfd_ip: wfd.and_then(|w| w.ip),
+            driver_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            driver_build_id: Some(env!("NFC_BRIDGE_BUILD_ID").to_string()),
         })
     }
 

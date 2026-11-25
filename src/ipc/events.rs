@@ -52,6 +52,10 @@ pub enum IpcEvent {
         wfd_ssid: Option<String>,
         wfd_passphrase: Option<String>,
         wfd_ip: Option<String>,
+        #[serde(default)]
+        driver_version: Option<String>,
+        #[serde(default)]
+        driver_build_id: Option<String>,
     },
     PairingTokenIssued {
         method: String,

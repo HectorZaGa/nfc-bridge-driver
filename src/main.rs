@@ -163,7 +163,11 @@ async fn run_driver(shutdown: Option<Arc<Notify>>, log_to_file: bool) -> anyhow:
     init_logging(log_to_file);
 
     info!("============================================================");
-    info!("    NFC BRIDGE DRIVER (Windows Silent Background Service)   ");
+    info!(
+        "    NFC BRIDGE DRIVER v{} (Build {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("NFC_BRIDGE_BUILD_ID")
+    );
     info!("============================================================");
 
     // 1. Instanciar el motor de emulación CCID compartido
