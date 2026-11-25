@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 
 use nfc_bridge_driver::emulator::{CcidHandler, UsbIpServer, USBIP_DEFAULT_PORT};
 use nfc_bridge_driver::ipc::{IpcEvent, NamedPipeIpcServer};
-use nfc_bridge_driver::network::{BridgeTcpServer, UsbAoaHost};
+use nfc_bridge_driver::network::{BluetoothRfcommServer, BridgeTcpServer, UsbAoaHost};
 
 fn run_hidden_command(program: &str, args: &[&str]) -> std::io::Result<std::process::ExitStatus> {
     let mut cmd = std::process::Command::new(program);
@@ -193,6 +193,12 @@ async fn run_driver(shutdown: Option<Arc<Notify>>, log_to_file: bool) -> anyhow:
     let aoa_host = Arc::new(UsbAoaHost::new(Arc::clone(&tcp_server)));
     tokio::spawn(async move {
         aoa_host.run().await;
+    });
+
+    // 6. Iniciar Servidor Bluetooth RFCOMM SPP nativo de Windows
+    let bt_server = Arc::new(BluetoothRfcommServer::new(Arc::clone(&tcp_server)));
+    tokio::spawn(async move {
+        bt_server.run().await;
     });
 
     // 6. Iniciar Servidor USB/IP (Puerto 3240 para emulación USB CCID ACR122U)
