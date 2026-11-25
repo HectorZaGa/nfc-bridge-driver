@@ -1,6 +1,6 @@
 [package]
 name = "nfc-bridge-driver"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 authors = ["Hector Zarate <HectorZaGa96@hotmail.com>"]
 description = "Ultra-low latency NFC bridge background driver and PC/SC emulator for Windows"
@@ -19,6 +19,7 @@ getrandom = "0.2"
 subtle = "2.6"
 rusb = { version = "0.9.4", features = ["vendored"] }
 futures-util = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 
 [target.'cfg(windows)'.dependencies]

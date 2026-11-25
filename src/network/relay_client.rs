@@ -7,7 +7,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
@@ -25,6 +25,14 @@ pub struct RelayClient {
     pairing: Arc<PairingManager>,
     is_connected: Arc<AtomicBool>,
     config_changed: Arc<Notify>,
+}
+
+static INIT_TLS_PROVIDER: Once = Once::new();
+
+fn ensure_rustls_crypto_provider() {
+    INIT_TLS_PROVIDER.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 impl RelayClient {
@@ -46,6 +54,7 @@ impl RelayClient {
     }
 
     pub async fn run(self: Arc<Self>) {
+        ensure_rustls_crypto_provider();
         info!("Monitor de enlace Cloud Relay iniciado.");
         let mut backoff_secs = 3u64;
 
@@ -162,5 +171,21 @@ impl RelayClient {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_rustls_crypto_provider;
+    use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
+
+    #[tokio::test]
+    async fn test_wss_connector_does_not_panic() {
+        ensure_rustls_crypto_provider();
+        let req = "wss://127.0.0.1:1/ws/nb-testsec01?role=pc"
+            .into_client_request()
+            .unwrap();
+        let res = connect_async(req).await;
+        assert!(res.is_err());
     }
 }
