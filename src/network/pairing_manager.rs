@@ -467,6 +467,12 @@ impl PairingManager {
             .collect()
     }
 
+    pub fn get_trusted_device(&self, device_id: &str) -> Option<TrustedDeviceInfo> {
+        self.list_trusted_devices()
+            .into_iter()
+            .find(|d| d.device_id == device_id)
+    }
+
     pub fn rename_trusted_device(&self, device_id: &str, new_name: &str) -> Option<String> {
         let clean = new_name.trim();
         if clean.is_empty() {

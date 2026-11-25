@@ -22,6 +22,7 @@ pub enum MessageType {
     // Estado del Dispositivo y Prioridad
     DeviceState = 0x30,
     UsbPriorityHint = 0x40,
+    SwitchTransport = 0x41,
 
     // Error
     ErrorFrame = 0xFF,
@@ -42,6 +43,7 @@ impl MessageType {
             0x21 => Some(Self::TransceiveResp),
             0x30 => Some(Self::DeviceState),
             0x40 => Some(Self::UsbPriorityHint),
+            0x41 => Some(Self::SwitchTransport),
             0xFF => Some(Self::ErrorFrame),
             _ => None,
         }

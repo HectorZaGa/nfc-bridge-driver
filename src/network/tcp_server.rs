@@ -292,6 +292,24 @@ impl BridgeTcpServer {
         self.disconnect_notify.notify_waiters();
     }
 
+    pub async fn switch_active_transport(&self, payload_json: String) {
+        let client_tx = {
+            let guard = self.active_client_tx.lock().await;
+            guard.clone()
+        };
+        if let Some(tx) = client_tx {
+            let seq = self.sequence_counter.fetch_add(1, Ordering::SeqCst);
+            let frame = NfcBridgeFrame::new(
+                MessageType::SwitchTransport,
+                seq,
+                payload_json.into_bytes(),
+            );
+            let _ = tx.send(frame).await;
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        self.disconnect_notify.notify_waiters();
+    }
+
     /// Inicia el listener TCP y el responder UDP de auto-descubrimiento en el puerto 45362.
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         let addr = format!("0.0.0.0:{}", DEFAULT_TCP_PORT);

@@ -39,6 +39,7 @@ pub enum IpcCommand {
     DisconnectDevice,
     RevokeTrustedDevice { device_id: String },
     RenameTrustedDevice { device_id: String, name: String },
+    SelectTrustedDevice { device_id: String },
 }
 
 /// Eventos emitidos en tiempo real por el Driver hacia las aplicaciones de escritorio.

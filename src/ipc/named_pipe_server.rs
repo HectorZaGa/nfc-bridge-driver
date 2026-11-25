@@ -193,6 +193,56 @@ impl NamedPipeIpcServer {
         })
     }
 
+    async fn ensure_method_enabled(&self, method: &str) -> bool {
+        let mut enabled_any = false;
+        match method {
+            "tcp" => {
+                if let Some(ref coord) = self.coordinator {
+                    if !coord.is_tcp_enabled() {
+                        coord.set_tcp_enabled(true).await;
+                        enabled_any = true;
+                    }
+                }
+            }
+            "bluetooth" => {
+                if let Some(ref bt) = self.bluetooth {
+                    if !bt.is_enabled() {
+                        bt.set_enabled(true);
+                        enabled_any = true;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                    }
+                }
+            }
+            "usb" => {
+                if let Some(ref usb) = self.usb_aoa {
+                    if !usb.is_enabled() {
+                        usb.set_enabled(true);
+                        enabled_any = true;
+                    }
+                }
+            }
+            "wifi_direct" => {
+                if let Some(ref wfd) = self.wifi_direct {
+                    if !wfd.is_enabled() {
+                        wfd.set_enabled(true);
+                        enabled_any = true;
+                        for _ in 0..14 {
+                            if wfd.current_snapshot().active {
+                                break;
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                    if let Some(ref coord) = self.coordinator {
+                        coord.set_wfd_accept_allowed(true, wfd.current_snapshot().ip);
+                    }
+                }
+            }
+            _ => {}
+        }
+        enabled_any
+    }
+
     /// Inicia el bucle que acepta clientes locales de Windows (Sync / Tools).
     pub async fn run(self: Arc<Self>) {
         info!("Iniciando servidor IPC Named Pipe en {}", NAMED_PIPE_NAME);
@@ -284,44 +334,7 @@ impl NamedPipeIpcServer {
                                                 }
                                             }
                                             IpcCommand::IssuePairingToken { method } => {
-                                                let mut transport_auto_enabled = false;
-                                                match method.as_str() {
-                                                    "tcp" => {
-                                                        if let Some(ref coord) = this.coordinator {
-                                                            if !coord.is_tcp_enabled() {
-                                                                coord.set_tcp_enabled(true).await;
-                                                                transport_auto_enabled = true;
-                                                            }
-                                                        }
-                                                    }
-                                                    "bluetooth" => {
-                                                        if let Some(ref bt) = this.bluetooth {
-                                                            if !bt.is_enabled() {
-                                                                bt.set_enabled(true);
-                                                                transport_auto_enabled = true;
-                                                                tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-                                                            }
-                                                        }
-                                                    }
-                                                    "wifi_direct" => {
-                                                        if let Some(ref wfd) = this.wifi_direct {
-                                                            if !wfd.is_enabled() {
-                                                                wfd.set_enabled(true);
-                                                                transport_auto_enabled = true;
-                                                                for _ in 0..14 {
-                                                                    if wfd.current_snapshot().active {
-                                                                        break;
-                                                                    }
-                                                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                                                }
-                                                            }
-                                                            if let Some(ref coord) = this.coordinator {
-                                                                coord.set_wfd_accept_allowed(true, wfd.current_snapshot().ip);
-                                                            }
-                                                        }
-                                                    }
-                                                    _ => {}
-                                                }
+                                                let transport_auto_enabled = this.ensure_method_enabled(&method).await;
                                                 if transport_auto_enabled {
                                                     if let Some(snapshot) = this.build_transport_snapshot() {
                                                         let _ = this.event_sender.send(snapshot);
@@ -480,6 +493,106 @@ impl NamedPipeIpcServer {
                                                     let _ = this.event_sender.send(snapshot);
                                                 }
                                             }
+                                            IpcCommand::SelectTrustedDevice { device_id } => {
+                                                let target = this
+                                                    .pairing
+                                                    .as_ref()
+                                                    .and_then(|p| p.get_trusted_device(&device_id));
+                                                let mut snapshot_dirty = false;
+                                                if let (Some(target), Some(ref coord)) =
+                                                    (target, this.coordinator.as_ref())
+                                                {
+                                                    let target_tr = target
+                                                        .transport
+                                                        .as_deref()
+                                                        .unwrap_or("tcp")
+                                                        .to_string();
+                                                    if this.ensure_method_enabled(&target_tr).await {
+                                                        snapshot_dirty = true;
+                                                    }
+                                                    if let IpcEvent::Status {
+                                                        connected: true,
+                                                        device_name: active_name,
+                                                        mobile_id: active_mid,
+                                                        active_device_id,
+                                                        ..
+                                                    } = coord.get_status_event().await
+                                                    {
+                                                        if active_device_id.as_deref()
+                                                            != Some(device_id.as_str())
+                                                        {
+                                                            let same_phone =
+                                                                match (&active_mid, &target.mobile_id)
+                                                                {
+                                                                    (Some(a), Some(b)) => {
+                                                                        a.eq_ignore_ascii_case(b)
+                                                                    }
+                                                                    _ => {
+                                                                        active_name.as_deref()
+                                                                            == Some(
+                                                                                target
+                                                                                    .device_name
+                                                                                    .as_str(),
+                                                                            )
+                                                                    }
+                                                                };
+                                                            if same_phone {
+                                                                if let Some(ref pairing) =
+                                                                    this.pairing
+                                                                {
+                                                                    let (pair_token, _) = pairing
+                                                                        .issue_ephemeral_token_for_method(
+                                                                            &target_tr,
+                                                                        );
+                                                                    let bt_info =
+                                                                        get_local_bluetooth_info();
+                                                                    let wfd = this
+                                                                        .wifi_direct
+                                                                        .as_ref()
+                                                                        .map(|w| w.current_snapshot());
+                                                                    let payload = serde_json::json!({
+                                                                        "transport": target_tr,
+                                                                        "pc_name": pairing.pc_name(),
+                                                                        "tcp_ip": detect_lan_ipv4(),
+                                                                        "tcp_port": DEFAULT_TCP_PORT,
+                                                                        "cert": pairing.get_tcp_cert_sha256(),
+                                                                        "bt_mac": bt_info.map(|(m, _)| m),
+                                                                        "relay_url": pairing.get_relay_url(),
+                                                                        "relay_channel": pairing.get_relay_channel(),
+                                                                        "wfd_ip": wfd.as_ref().and_then(|w| w.ip.clone()),
+                                                                        "wfd_ssid": wfd.as_ref().and_then(|w| w.ssid.clone()),
+                                                                        "wfd_pass": wfd.as_ref().and_then(|w| w.passphrase.clone()),
+                                                                        "pair_token": pair_token,
+                                                                    })
+                                                                    .to_string();
+                                                                    info!(
+                                                                        "Solicitando cambio de transporte del móvil activo hacia '{}' ({})",
+                                                                        target_tr, device_id
+                                                                    );
+                                                                    coord
+                                                                        .switch_active_transport(
+                                                                            payload,
+                                                                        )
+                                                                        .await;
+                                                                }
+                                                            } else {
+                                                                info!(
+                                                                    "Desconectando perfil actual para priorizar el seleccionado ({})",
+                                                                    device_id
+                                                                );
+                                                                coord.disconnect_active().await;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if snapshot_dirty {
+                                                    if let Some(snapshot) =
+                                                        this.build_transport_snapshot()
+                                                    {
+                                                        let _ = this.event_sender.send(snapshot);
+                                                    }
+                                                }
+                                            }
                                             other_cmd => {
                                                 if let Some(ref coord) = this.coordinator {
                                                     match other_cmd {
@@ -508,7 +621,8 @@ impl NamedPipeIpcServer {
                                                         | IpcCommand::IssuePairingToken { .. }
                                                         | IpcCommand::SetRelayUrl { .. }
                                                         | IpcCommand::RevokeTrustedDevice { .. }
-                                                        | IpcCommand::RenameTrustedDevice { .. } => {}
+                                                        | IpcCommand::RenameTrustedDevice { .. }
+                                                        | IpcCommand::SelectTrustedDevice { .. } => {}
                                                     }
                                                 }
                                             }
