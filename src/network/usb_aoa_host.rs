@@ -110,11 +110,13 @@ impl UsbAoaHost {
                 .unwrap_or(true);
 
             if need_usbdk_upgrade {
+                // Asegurar init_count == 0 en libusb para que reevalúe UsbDkHelper.dll si recién se instaló.
+                let was_non_usbdk = backend.as_ref().map(|b| !b.using_usbdk).unwrap_or(false);
+                backend = None;
+
                 match Self::init_usb_backend(warn_missing) {
                     Ok(new_backend) => {
-                        if new_backend.using_usbdk
-                            && backend.as_ref().map(|b| !b.using_usbdk).unwrap_or(false)
-                        {
+                        if new_backend.using_usbdk && was_non_usbdk {
                             // Al pasar a UsbDk en caliente, reintentar dispositivos ya conectados.
                             attempted_devices.clear();
                         }
