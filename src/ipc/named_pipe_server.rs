@@ -467,6 +467,7 @@ impl NamedPipeIpcServer {
                                                     if let (Some(ref coord), Some(ref pairing)) =
                                                         (this.coordinator.as_ref(), this.pairing.as_ref())
                                                     {
+                                                        coord.clear_last_active_device().await;
                                                         if let IpcEvent::Status {
                                                             connected: true,
                                                             device_name: active_name,
@@ -717,6 +718,7 @@ impl NamedPipeIpcServer {
                                                             coord.set_paused(paused).await;
                                                         }
                                                         IpcCommand::DisconnectDevice => {
+                                                            coord.clear_last_active_device().await;
                                                             coord.disconnect_active().await;
                                                         }
                                                         IpcCommand::SetUsbPriority { .. }

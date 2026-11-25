@@ -35,6 +35,7 @@ pub struct DriverRuntimeStatus {
     pub mobile_id: Option<String>,
     pub device_os: Option<String>,
     pub active_device_id: Option<String>,
+    pub last_active_device_id: Option<(String, Instant)>,
     pub latency_ms: u64,
     pub paused: bool,
     pub tag_present: bool,
@@ -109,6 +110,11 @@ impl BridgeTcpServer {
         self.tcp_rebind_notify.notify_waiters();
     }
 
+    pub async fn clear_last_active_device(&self) {
+        let mut st = self.runtime_status.lock().await;
+        st.last_active_device_id = None;
+    }
+
     pub async fn mark_approved_sync_switch(&self, mobile_id: Option<String>, transport: String) {
         let mut guard = self.approved_sync_switch.lock().await;
         *guard = Some((mobile_id, transport, Instant::now() + Duration::from_secs(20)));
@@ -136,16 +142,24 @@ impl BridgeTcpServer {
         device_label: &str,
         is_fresh_qr_pair: bool,
     ) -> bool {
-        let (is_connected, active_id) = {
+        let (is_connected, active_id, last_active_id) = {
             let st = self.runtime_status.lock().await;
-            (st.connected, st.active_device_id.clone())
+            let recent_last = st
+                .last_active_device_id
+                .as_ref()
+                .filter(|(_, ts)| ts.elapsed() < Duration::from_secs(45))
+                .map(|(id, _)| id.clone());
+            (st.connected, st.active_device_id.clone(), recent_last)
         };
-        if !is_connected || active_id == auth_res.device_id {
+        let previous_id = if is_connected { active_id } else { last_active_id };
+        if previous_id.is_none() || previous_id == auth_res.device_id {
             return true;
         }
         if self.pairing.get_auto_accept_mobile_switch() || is_fresh_qr_pair {
-            self.disconnect_notify.notify_waiters();
-            tokio::time::sleep(Duration::from_millis(60)).await;
+            if is_connected {
+                self.disconnect_notify.notify_waiters();
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
             return true;
         }
         {
@@ -781,6 +795,9 @@ impl BridgeTcpServer {
             }
             {
                 let mut st = self.runtime_status.lock().await;
+                if st.connected && st.active_device_id.is_some() {
+                    st.last_active_device_id = st.active_device_id.clone().map(|id| (id, Instant::now()));
+                }
                 st.connected = false;
                 st.device_name = None;
                 st.endpoint = None;
@@ -1105,6 +1122,10 @@ impl BridgeTcpServer {
             MessageType::Disconnect => {
                 if authenticated {
                     info!("Móvil solicitó desconexión limpia ({})", peer_endpoint);
+                    {
+                        let mut st = self.runtime_status.lock().await;
+                        st.last_active_device_id = None;
+                    }
                     session_cancel.notify_waiters();
                 }
                 false
@@ -1147,7 +1168,8 @@ impl BridgeTcpServer {
             st.transport = transport;
             st.mobile_id = mobile_id;
             st.device_os = device_os;
-            st.active_device_id = active_device_id;
+            st.active_device_id = active_device_id.clone();
+            st.last_active_device_id = active_device_id.map(|id| (id, Instant::now()));
         }
         self.apply_pause_state(phone_paused).await;
         let _ = self.event_tx.send(IpcEvent::DeviceConnected {
