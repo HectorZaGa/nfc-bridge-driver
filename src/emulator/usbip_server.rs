@@ -50,13 +50,13 @@ impl UsbIpServer {
         }
     }
 
-    /// Inicia el bucle de escucha del servidor USB/IP en 0.0.0.0:port
+    /// Inicia el bucle de escucha del servidor USB/IP en 127.0.0.1:port (solo loopback local)
     pub async fn start<F, Fut>(&self, transceive_callback: F) -> anyhow::Result<()>
     where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
         Fut: std::future::Future<Output = Option<Vec<u8>>> + Send + 'static,
     {
-        let addr = format!("0.0.0.0:{}", self.bind_port);
+        let addr = format!("127.0.0.1:{}", self.bind_port);
         let listener = TcpListener::bind(&addr).await?;
         info!("USB/IP Server escuchando en {} (ACR122U USB CCID Emulator)", addr);
 

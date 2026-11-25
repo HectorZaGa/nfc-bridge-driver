@@ -104,21 +104,6 @@ impl BridgeTcpServer {
         self.disconnect_notify.notify_waiters();
     }
 
-    async fn update_connected_device_name(&self, device_name: Option<String>) {
-        let Some(name) = device_name else {
-            return;
-        };
-        let endpoint = {
-            let mut st = self.runtime_status.lock().await;
-            st.device_name = Some(name.clone());
-            st.endpoint.clone().unwrap_or_default()
-        };
-        let _ = self.event_tx.send(IpcEvent::DeviceConnected {
-            device_name: name,
-            endpoint,
-        });
-    }
-
     /// Inicia el listener TCP y el responder UDP de auto-descubrimiento en el puerto 45362.
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         let addr = format!("0.0.0.0:{}", DEFAULT_TCP_PORT);
@@ -256,22 +241,9 @@ impl BridgeTcpServer {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let (out_tx, mut out_rx) = mpsc::channel::<NfcBridgeFrame>(128);
-
-        {
-            let mut active = self.active_client_tx.lock().await;
-            *active = Some(out_tx.clone());
-        }
-        {
-            let mut st = self.runtime_status.lock().await;
-            st.connected = true;
-            st.device_name = Some("Android Phone".to_string());
-            st.endpoint = Some(peer_endpoint.clone());
-        }
-
-        let _ = self.event_tx.send(IpcEvent::DeviceConnected {
-            device_name: "Android Phone".to_string(),
-            endpoint: peer_endpoint.clone(),
-        });
+        let session_cancel = Arc::new(Notify::new());
+        let require_token = peer_endpoint == "Cloud Relay";
+        let mut authenticated = false;
 
         let write_task = tokio::spawn(async move {
             while let Some(frame) = out_rx.recv().await {
@@ -305,7 +277,9 @@ impl BridgeTcpServer {
                     let latency = rtt_ms.max(1);
                     {
                         let mut st = hb_status.lock().await;
-                        st.latency_ms = latency;
+                        if st.connected {
+                            st.latency_ms = latency;
+                        }
                     }
                     let _ = hb_event_tx.send(IpcEvent::LatencyUpdated { latency_ms: latency });
                 } else {
@@ -319,8 +293,12 @@ impl BridgeTcpServer {
 
         loop {
             tokio::select! {
-                _ = self.disconnect_notify.notified() => {
+                _ = self.disconnect_notify.notified(), if authenticated => {
                     info!("Desconexión solicitada vía IPC para {}", peer_endpoint);
+                    break;
+                }
+                _ = session_cancel.notified() => {
+                    info!("Sesión cerrada tras rechazo o fin de enlace ({})", peer_endpoint);
                     break;
                 }
                 read_res = reader.read(&mut buffer) => {
@@ -332,7 +310,23 @@ impl BridgeTcpServer {
                         Ok(n) => {
                             let frames = decoder.feed(&buffer[..n]);
                             for frame in frames {
-                                self.process_frame(frame, &out_tx).await;
+                                let just_authed = self
+                                    .process_frame(
+                                        frame,
+                                        &out_tx,
+                                        authenticated,
+                                        require_token,
+                                        &peer_endpoint,
+                                        &session_cancel,
+                                    )
+                                    .await;
+                                if just_authed && !authenticated {
+                                    authenticated = true;
+                                    {
+                                        let mut active = self.active_client_tx.lock().await;
+                                        *active = Some(out_tx.clone());
+                                    }
+                                }
                             }
                         }
                         Err(e) => {
@@ -348,35 +342,43 @@ impl BridgeTcpServer {
         heartbeat_task.abort();
         write_task.abort();
 
-        {
-            let mut active = self.active_client_tx.lock().await;
-            *active = None;
-        }
-        {
-            let mut st = self.runtime_status.lock().await;
-            st.connected = false;
-            st.device_name = None;
-            st.endpoint = None;
-            st.tag_present = false;
-            st.tag_uid = None;
-        }
-        {
-            let mut handler = self.ccid_handler.lock().await;
-            handler.set_tag(None);
-        }
+        if authenticated {
+            {
+                let mut active = self.active_client_tx.lock().await;
+                *active = None;
+            }
+            {
+                let mut st = self.runtime_status.lock().await;
+                st.connected = false;
+                st.device_name = None;
+                st.endpoint = None;
+                st.tag_present = false;
+                st.tag_uid = None;
+            }
+            {
+                let mut handler = self.ccid_handler.lock().await;
+                handler.set_tag(None);
+            }
 
-        let _ = self.event_tx.send(IpcEvent::DeviceDisconnected);
+            let _ = self.event_tx.send(IpcEvent::DeviceDisconnected);
+        }
     }
 
     async fn process_frame(
         &self,
         frame: NfcBridgeFrame,
         out_tx: &mpsc::Sender<NfcBridgeFrame>,
-    ) {
+        authenticated: bool,
+        require_token: bool,
+        peer_endpoint: &str,
+        session_cancel: &Arc<Notify>,
+    ) -> bool {
         match frame.message_type {
             MessageType::HelloSyn => {
                 let pc_name = self.pairing.pc_name().to_string();
-                let outcome = self.pairing.validate_hello_payload(&frame.payload);
+                let outcome = self
+                    .pairing
+                    .validate_hello_payload_for_transport(&frame.payload, require_token);
                 match outcome {
                     HelloAuthOutcome::Rejected { reason } => {
                         warn!("Handshake HELLO_SYN rechazado ({})", reason);
@@ -392,18 +394,29 @@ impl BridgeTcpServer {
                             payload.into_bytes(),
                         );
                         let _ = out_tx.send(ack_frame).await;
-                        let notify = Arc::clone(&self.disconnect_notify);
+                        let cancel = Arc::clone(session_cancel);
                         tokio::spawn(async move {
                             tokio::time::sleep(Duration::from_millis(80)).await;
-                            notify.notify_waiters();
+                            cancel.notify_waiters();
                         });
+                        false
                     }
                     HelloAuthOutcome::Paired {
                         device_name,
                         new_device_token,
                     } => {
                         info!("Handshake HELLO_SYN emparejado con QR/Link (nuevo device_token emitido)");
-                        self.update_connected_device_name(device_name).await;
+                        let name = device_name.unwrap_or_else(|| "Android Phone".to_string());
+                        {
+                            let mut st = self.runtime_status.lock().await;
+                            st.connected = true;
+                            st.device_name = Some(name.clone());
+                            st.endpoint = Some(peer_endpoint.to_string());
+                        }
+                        let _ = self.event_tx.send(IpcEvent::DeviceConnected {
+                            device_name: name,
+                            endpoint: peer_endpoint.to_string(),
+                        });
                         let payload = serde_json::json!({
                             "pc_name": pc_name,
                             "status": "ready",
@@ -416,11 +429,22 @@ impl BridgeTcpServer {
                             payload.into_bytes(),
                         );
                         let _ = out_tx.send(ack_frame).await;
+                        true
                     }
                     HelloAuthOutcome::Trusted { device_name }
                     | HelloAuthOutcome::LegacyAllowed { device_name } => {
                         info!("Handshake HELLO_SYN recibido del móvil. Respondiendo HELLO_ACK...");
-                        self.update_connected_device_name(device_name).await;
+                        let name = device_name.unwrap_or_else(|| "Android Phone".to_string());
+                        {
+                            let mut st = self.runtime_status.lock().await;
+                            st.connected = true;
+                            st.device_name = Some(name.clone());
+                            st.endpoint = Some(peer_endpoint.to_string());
+                        }
+                        let _ = self.event_tx.send(IpcEvent::DeviceConnected {
+                            device_name: name,
+                            endpoint: peer_endpoint.to_string(),
+                        });
                         let payload = serde_json::json!({
                             "pc_name": pc_name,
                             "status": "ready"
@@ -432,12 +456,13 @@ impl BridgeTcpServer {
                             payload.into_bytes(),
                         );
                         let _ = out_tx.send(ack_frame).await;
+                        true
                     }
                 }
             }
             MessageType::TagAttached => {
-                if self.is_paused.load(Ordering::Relaxed) {
-                    return;
+                if !authenticated || self.is_paused.load(Ordering::Relaxed) {
+                    return false;
                 }
                 if let Some(tag) = FrameCodec::decode_tag_attached(&frame.payload) {
                     let uid_hex = tag.uid_hex();
@@ -465,8 +490,12 @@ impl BridgeTcpServer {
                         is_ntag215,
                     });
                 }
+                false
             }
             MessageType::TagDetached => {
+                if !authenticated {
+                    return false;
+                }
                 info!("ETIQUETA NFC RETIRADA del campo");
                 {
                     let mut st = self.runtime_status.lock().await;
@@ -478,8 +507,12 @@ impl BridgeTcpServer {
                     handler.set_tag(None);
                 }
                 let _ = self.event_tx.send(IpcEvent::TagDetached);
+                false
             }
             MessageType::TransceiveResp => {
+                if !authenticated {
+                    return false;
+                }
                 debug!("TRANSCEIVE_RESP recibido del móvil para seq={}", frame.sequence_id);
                 let mut pending = self.pending_transceive.lock().await;
                 if let Some((expected_seq, _)) = &*pending {
@@ -489,14 +522,17 @@ impl BridgeTcpServer {
                         }
                     }
                 }
+                false
             }
             MessageType::Heartbeat => {
                 let ack = NfcBridgeFrame::new(MessageType::HeartbeatAck, frame.sequence_id, vec![]);
                 let _ = out_tx.send(ack).await;
+                false
             }
-            MessageType::HeartbeatAck => {}
+            MessageType::HeartbeatAck => false,
             _ => {
                 info!("Trama recibida: tipo={:?}, seq={}", frame.message_type, frame.sequence_id);
+                false
             }
         }
     }

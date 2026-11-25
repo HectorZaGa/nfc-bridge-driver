@@ -11,7 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, Message},
+};
 use tracing::{debug, info, warn};
 
 use crate::network::pairing_manager::to_ws_base;
@@ -56,16 +59,26 @@ impl RelayClient {
 
             let ws_base = to_ws_base(&raw_url);
             let channel = self.pairing.get_relay_channel();
+            let host_secret = self.pairing.get_relay_host_secret();
             let ws_url = format!("{}/ws/{}?role=pc", ws_base, channel);
 
             info!("Conectando canal Cloud Relay ({})...", ws_base);
+
+            let Ok(mut ws_req) = ws_url.into_client_request() else {
+                warn!("URL de Cloud Relay inválida: {}", ws_base);
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                continue;
+            };
+            if let Ok(header_val) = format!("Bearer {}", host_secret).parse() {
+                ws_req.headers_mut().insert("Authorization", header_val);
+            }
 
             let connect_res = tokio::select! {
                 _ = self.config_changed.notified() => {
                     backoff_secs = 3;
                     continue;
                 }
-                res = connect_async(&ws_url) => res,
+                res = connect_async(ws_req) => res,
             };
 
             match connect_res {
