@@ -9,6 +9,10 @@ pub struct TrustedDeviceInfo {
     pub created_unix: u64,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Comandos que las aplicaciones de escritorio pueden enviar al Driver.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", content = "params")]
@@ -20,6 +24,10 @@ pub enum IpcCommand {
     SetRelayUrl { url: Option<String> },
     SetPaused { paused: bool },
     SetUsbPriority { enabled: bool },
+    SetUsbEnabled { enabled: bool },
+    SetTcpEnabled { enabled: bool },
+    SetWifiDirectEnabled { enabled: bool },
+    SetBluetoothEnabled { enabled: bool },
     DisconnectDevice,
     RevokeTrustedDevice { device_id: String },
 }
@@ -60,6 +68,18 @@ pub enum IpcEvent {
         wfd_ssid: Option<String>,
         wfd_passphrase: Option<String>,
         wfd_ip: Option<String>,
+        #[serde(default = "default_true")]
+        tcp_enabled: bool,
+        #[serde(default)]
+        wfd_enabled: bool,
+        #[serde(default = "default_true")]
+        bt_enabled: bool,
+        #[serde(default = "default_true")]
+        usb_enabled: bool,
+        #[serde(default = "default_true")]
+        usb_auto_connect: bool,
+        #[serde(default)]
+        usb_connected: bool,
         #[serde(default)]
         driver_version: Option<String>,
         #[serde(default)]

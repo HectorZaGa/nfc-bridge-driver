@@ -9,7 +9,8 @@ use tracing::{error, info, warn};
 use super::events::{IpcCommand, IpcEvent};
 use crate::network::pairing_manager::detect_lan_ipv4;
 use crate::network::{
-    get_local_bluetooth_info, BridgeTcpServer, PairingManager, RelayClient, WifiDirectServer,
+    get_local_bluetooth_info, BluetoothRfcommServer, BridgeTcpServer, PairingManager, RelayClient,
+    UsbAoaHost, WifiDirectServer,
 };
 use crate::protocol::constants::{DEFAULT_TCP_PORT, NAMED_PIPE_NAME};
 
@@ -19,6 +20,8 @@ pub struct NamedPipeIpcServer {
     wifi_direct: Option<Arc<WifiDirectServer>>,
     pairing: Option<Arc<PairingManager>>,
     relay_client: Option<Arc<RelayClient>>,
+    usb_aoa: Option<Arc<UsbAoaHost>>,
+    bluetooth: Option<Arc<BluetoothRfcommServer>>,
 }
 
 #[cfg(windows)]
@@ -81,6 +84,8 @@ impl NamedPipeIpcServer {
             wifi_direct: None,
             pairing: None,
             relay_client: None,
+            usb_aoa: None,
+            bluetooth: None,
         }
     }
 
@@ -94,6 +99,8 @@ impl NamedPipeIpcServer {
             wifi_direct: None,
             pairing: None,
             relay_client: None,
+            usb_aoa: None,
+            bluetooth: None,
         }
     }
 
@@ -103,6 +110,8 @@ impl NamedPipeIpcServer {
         wifi_direct: Arc<WifiDirectServer>,
         pairing: Arc<PairingManager>,
         relay_client: Arc<RelayClient>,
+        usb_aoa: Arc<UsbAoaHost>,
+        bluetooth: Arc<BluetoothRfcommServer>,
     ) -> Self {
         Self {
             event_sender,
@@ -110,6 +119,8 @@ impl NamedPipeIpcServer {
             wifi_direct: Some(wifi_direct),
             pairing: Some(pairing),
             relay_client: Some(relay_client),
+            usb_aoa: Some(usb_aoa),
+            bluetooth: Some(bluetooth),
         }
     }
 
@@ -124,6 +135,36 @@ impl NamedPipeIpcServer {
             .relay_client
             .as_ref()
             .map(|r| r.is_connected())
+            .unwrap_or(false);
+        let tcp_enabled = self
+            .coordinator
+            .as_ref()
+            .map(|c| c.is_tcp_enabled())
+            .unwrap_or(true);
+        let wfd_enabled = self
+            .wifi_direct
+            .as_ref()
+            .map(|w| w.is_enabled())
+            .unwrap_or(false);
+        let bt_enabled = self
+            .bluetooth
+            .as_ref()
+            .map(|b| b.is_enabled())
+            .unwrap_or(true);
+        let usb_enabled = self
+            .usb_aoa
+            .as_ref()
+            .map(|u| u.is_enabled())
+            .unwrap_or(true);
+        let usb_auto_connect = self
+            .usb_aoa
+            .as_ref()
+            .map(|u| u.is_auto_connect())
+            .unwrap_or(true);
+        let usb_connected = self
+            .coordinator
+            .as_ref()
+            .map(|c| c.is_usb_connected())
             .unwrap_or(false);
 
         Some(IpcEvent::TransportSnapshot {
@@ -140,6 +181,12 @@ impl NamedPipeIpcServer {
             wfd_ssid: wfd.as_ref().and_then(|w| w.ssid.clone()),
             wfd_passphrase: wfd.as_ref().and_then(|w| w.passphrase.clone()),
             wfd_ip: wfd.and_then(|w| w.ip),
+            tcp_enabled,
+            wfd_enabled,
+            bt_enabled,
+            usb_enabled,
+            usb_auto_connect,
+            usb_connected,
             driver_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             driver_build_id: Some(env!("NFC_BRIDGE_BUILD_ID").to_string()),
             trusted_devices: pairing.list_trusted_devices(),
@@ -237,6 +284,50 @@ impl NamedPipeIpcServer {
                                                 }
                                             }
                                             IpcCommand::IssuePairingToken { method } => {
+                                                let mut transport_auto_enabled = false;
+                                                match method.as_str() {
+                                                    "tcp" => {
+                                                        if let Some(ref coord) = this.coordinator {
+                                                            if !coord.is_tcp_enabled() {
+                                                                coord.set_tcp_enabled(true).await;
+                                                                transport_auto_enabled = true;
+                                                            }
+                                                        }
+                                                    }
+                                                    "bluetooth" => {
+                                                        if let Some(ref bt) = this.bluetooth {
+                                                            if !bt.is_enabled() {
+                                                                bt.set_enabled(true);
+                                                                transport_auto_enabled = true;
+                                                                tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                                                            }
+                                                        }
+                                                    }
+                                                    "wifi_direct" => {
+                                                        if let Some(ref wfd) = this.wifi_direct {
+                                                            if !wfd.is_enabled() {
+                                                                wfd.set_enabled(true);
+                                                                transport_auto_enabled = true;
+                                                                for _ in 0..14 {
+                                                                    if wfd.current_snapshot().active {
+                                                                        break;
+                                                                    }
+                                                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                                                }
+                                                            }
+                                                            if let Some(ref coord) = this.coordinator {
+                                                                coord.set_wfd_accept_allowed(true, wfd.current_snapshot().ip);
+                                                            }
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                                if transport_auto_enabled {
+                                                    if let Some(snapshot) = this.build_transport_snapshot() {
+                                                        let _ = this.event_sender.send(snapshot);
+                                                    }
+                                                }
+
                                                 if let Some(ref pairing) = this.pairing {
                                                     let (pair_token, expires_in_secs) = pairing.issue_ephemeral_token();
                                                     let bt_info = get_local_bluetooth_info();
@@ -273,6 +364,76 @@ impl NamedPipeIpcServer {
                                                 }
                                                 if let Some(ref relay) = this.relay_client {
                                                     relay.notify_config_changed();
+                                                }
+                                                if let Some(snapshot) = this.build_transport_snapshot() {
+                                                    let _ = this.event_sender.send(snapshot);
+                                                }
+                                            }
+                                            IpcCommand::SetTcpEnabled { enabled } => {
+                                                if let Some(ref coord) = this.coordinator {
+                                                    coord.set_tcp_enabled(enabled).await;
+                                                }
+                                                if let Some(snapshot) = this.build_transport_snapshot() {
+                                                    let _ = this.event_sender.send(snapshot);
+                                                }
+                                            }
+                                            IpcCommand::SetWifiDirectEnabled { enabled } => {
+                                                if let Some(ref wfd) = this.wifi_direct {
+                                                    wfd.set_enabled(enabled);
+                                                    if enabled {
+                                                        for _ in 0..12 {
+                                                            if wfd.current_snapshot().active {
+                                                                break;
+                                                            }
+                                                            tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+                                                        }
+                                                    }
+                                                    if let Some(ref coord) = this.coordinator {
+                                                        coord.set_wfd_accept_allowed(enabled, wfd.current_snapshot().ip);
+                                                        if !enabled {
+                                                            coord.disconnect_if_wfd().await;
+                                                        }
+                                                    }
+                                                }
+                                                if let Some(snapshot) = this.build_transport_snapshot() {
+                                                    let _ = this.event_sender.send(snapshot);
+                                                }
+                                            }
+                                            IpcCommand::SetBluetoothEnabled { enabled } => {
+                                                if let Some(ref bt) = this.bluetooth {
+                                                    bt.set_enabled(enabled);
+                                                }
+                                                if !enabled {
+                                                    if let Some(ref coord) = this.coordinator {
+                                                        coord.disconnect_if_endpoint_starts_with("Bluetooth").await;
+                                                    }
+                                                }
+                                                if let Some(snapshot) = this.build_transport_snapshot() {
+                                                    let _ = this.event_sender.send(snapshot);
+                                                }
+                                            }
+                                            IpcCommand::SetUsbEnabled { enabled } => {
+                                                if let Some(ref usb) = this.usb_aoa {
+                                                    usb.set_enabled(enabled);
+                                                }
+                                                if !enabled {
+                                                    if let Some(ref coord) = this.coordinator {
+                                                        coord.disconnect_if_endpoint_starts_with("USB-AOA").await;
+                                                    }
+                                                }
+                                                if let Some(snapshot) = this.build_transport_snapshot() {
+                                                    let _ = this.event_sender.send(snapshot);
+                                                }
+                                            }
+                                            IpcCommand::SetUsbPriority { enabled } => {
+                                                if let Some(ref usb) = this.usb_aoa {
+                                                    usb.set_auto_connect(enabled);
+                                                    if enabled && !usb.is_enabled() {
+                                                        usb.set_enabled(true);
+                                                    }
+                                                }
+                                                if let Some(ref coord) = this.coordinator {
+                                                    coord.set_usb_auto_connect(enabled).await;
                                                 }
                                                 if let Some(snapshot) = this.build_transport_snapshot() {
                                                     let _ = this.event_sender.send(snapshot);
@@ -320,6 +481,10 @@ impl NamedPipeIpcServer {
                                                             coord.disconnect_active().await;
                                                         }
                                                         IpcCommand::SetUsbPriority { .. }
+                                                        | IpcCommand::SetUsbEnabled { .. }
+                                                        | IpcCommand::SetTcpEnabled { .. }
+                                                        | IpcCommand::SetWifiDirectEnabled { .. }
+                                                        | IpcCommand::SetBluetoothEnabled { .. }
                                                         | IpcCommand::GetWifiDirectInfo
                                                         | IpcCommand::GetTransportSnapshot
                                                         | IpcCommand::IssuePairingToken { .. }

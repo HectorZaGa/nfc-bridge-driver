@@ -192,6 +192,8 @@ async fn run_driver(shutdown: Option<Arc<Notify>>, log_to_file: bool) -> anyhow:
         Arc::clone(&tcp_server),
         Arc::clone(&pairing_mgr),
     ));
+    let aoa_host = Arc::new(UsbAoaHost::new(Arc::clone(&tcp_server)));
+    let bt_server = Arc::new(BluetoothRfcommServer::new(Arc::clone(&tcp_server)));
 
     // 3. Iniciar Servidor IPC (Named Pipe de Windows: \\.\pipe\nfc_bridge_driver)
     let ipc_server = Arc::new(NamedPipeIpcServer::with_transports(
@@ -200,6 +202,8 @@ async fn run_driver(shutdown: Option<Arc<Notify>>, log_to_file: bool) -> anyhow:
         Arc::clone(&wfd_server),
         Arc::clone(&pairing_mgr),
         Arc::clone(&relay_client),
+        Arc::clone(&aoa_host),
+        Arc::clone(&bt_server),
     ));
     tokio::spawn(async move {
         ipc_server.run().await;
@@ -214,15 +218,15 @@ async fn run_driver(shutdown: Option<Arc<Notify>>, log_to_file: bool) -> anyhow:
     });
 
     // 5. Iniciar Host USB AOA (Android Open Accessory puro sin ADB ni red)
-    let aoa_host = Arc::new(UsbAoaHost::new(Arc::clone(&tcp_server)));
+    let aoa_host_for_run = Arc::clone(&aoa_host);
     tokio::spawn(async move {
-        aoa_host.run().await;
+        aoa_host_for_run.run().await;
     });
 
     // 6. Iniciar Servidor Bluetooth RFCOMM SPP nativo de Windows
-    let bt_server = Arc::new(BluetoothRfcommServer::new(Arc::clone(&tcp_server)));
+    let bt_server_for_run = Arc::clone(&bt_server);
     tokio::spawn(async move {
-        bt_server.run().await;
+        bt_server_for_run.run().await;
     });
 
     // 7. Iniciar Servidor Wi-Fi Direct (P2P nativo + Legacy SoftAP automático)

@@ -10,9 +10,10 @@
 //! una vez establecido el grupo P2P o SoftAP, sin necesidad de router externo.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 use tracing::{info, warn};
 
 use crate::ipc::events::IpcEvent;
@@ -61,6 +62,8 @@ impl WifiDirectRuntimeInfo {
 pub struct WifiDirectServer {
     event_tx: broadcast::Sender<IpcEvent>,
     state: Arc<StdMutex<WifiDirectRuntimeInfo>>,
+    enabled: Arc<AtomicBool>,
+    wake_notify: Arc<Notify>,
 }
 
 impl WifiDirectServer {
@@ -71,9 +74,36 @@ impl WifiDirectServer {
             event_tx,
             state: Arc::new(StdMutex::new(WifiDirectRuntimeInfo::unavailable(
                 pc_name,
-                "Inicializando Wi-Fi Direct...".to_string(),
+                "Wi-Fi Direct desactivado".to_string(),
             ))),
+            enabled: Arc::new(AtomicBool::new(false)),
+            wake_notify: Arc::new(Notify::new()),
         }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        let prev = self.enabled.swap(enabled, Ordering::Relaxed);
+        if prev != enabled || !enabled {
+            let evt = if let Ok(mut guard) = self.state.lock() {
+                guard.active = false;
+                if enabled {
+                    guard.reason = Some("Iniciando Wi-Fi Direct...".to_string());
+                } else {
+                    guard.reason = Some("Wi-Fi Direct desactivado".to_string());
+                }
+                Some(guard.to_ipc_event())
+            } else {
+                None
+            };
+            if let Some(evt) = evt {
+                let _ = self.event_tx.send(evt);
+            }
+        }
+        self.wake_notify.notify_waiters();
     }
 
     pub fn current_snapshot(&self) -> WifiDirectRuntimeInfo {
@@ -107,19 +137,32 @@ impl WifiDirectServer {
     pub async fn run(self: Arc<Self>) {
         #[cfg(windows)]
         {
-            info!("Monitor Wi-Fi Direct (P2P + Legacy SoftAP) iniciado.");
+            info!("Monitor Wi-Fi Direct (P2P + Legacy SoftAP) listo (en espera de activación).");
             let mut last_logged_reason: Option<String> = None;
 
             loop {
+                if !self.enabled.load(Ordering::Relaxed) {
+                    let available = windows_wfd::check_wlan_ready().is_ok();
+                    self.publish_disabled(available);
+                    self.wake_notify.notified().await;
+                    last_logged_reason = None;
+                    continue;
+                }
+
                 match windows_wfd::check_wlan_ready() {
                     Ok(()) => {
                         last_logged_reason = None;
                         let state = Arc::clone(&self.state);
                         let event_tx = self.event_tx.clone();
+                        let enabled_flag = Arc::clone(&self.enabled);
                         let res = tokio::task::spawn_blocking(move || {
-                            windows_wfd::run_wifi_direct_session(state, event_tx)
+                            windows_wfd::run_wifi_direct_session(state, event_tx, enabled_flag)
                         })
                         .await;
+
+                        if !self.enabled.load(Ordering::Relaxed) {
+                            continue;
+                        }
 
                         match res {
                             Ok(Ok(())) => {
@@ -137,7 +180,10 @@ impl WifiDirectServer {
                                 warn!("Hilo Wi-Fi Direct interrumpido ({}). Reintentando en 15 s...", e);
                             }
                         }
-                        tokio::time::sleep(Duration::from_secs(15)).await;
+                        tokio::select! {
+                            _ = self.wake_notify.notified() => {},
+                            _ = tokio::time::sleep(Duration::from_secs(15)) => {},
+                        }
                     }
                     Err(reason) => {
                         if last_logged_reason.as_deref() != Some(reason.as_str()) {
@@ -148,7 +194,10 @@ impl WifiDirectServer {
                             last_logged_reason = Some(reason.clone());
                         }
                         self.publish_unavailable(reason);
-                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        tokio::select! {
+                            _ = self.wake_notify.notified() => {},
+                            _ = tokio::time::sleep(Duration::from_secs(30)) => {},
+                        }
                     }
                 }
             }
@@ -158,6 +207,24 @@ impl WifiDirectServer {
         {
             let _ = (&self.event_tx, &self.state);
         }
+    }
+
+    fn publish_disabled(&self, available: bool) {
+        let evt = {
+            let mut guard = match self.state.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            guard.available = available;
+            guard.active = false;
+            guard.reason = Some(if available {
+                "Wi-Fi Direct desactivado".to_string()
+            } else {
+                "Sin adaptador Wi-Fi activo".to_string()
+            });
+            guard.to_ipc_event()
+        };
+        let _ = self.event_tx.send(evt);
     }
 
     fn publish_unavailable(&self, reason: String) {
@@ -343,6 +410,7 @@ mod windows_wfd {
     pub fn run_wifi_direct_session(
         state: Arc<StdMutex<WifiDirectRuntimeInfo>>,
         event_tx: broadcast::Sender<IpcEvent>,
+        enabled: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         let _com_guard = if hr == RPC_E_CHANGED_MODE {
@@ -466,14 +534,26 @@ mod windows_wfd {
             info.reason = None;
         });
 
+        let mut ticks = 0u32;
         loop {
-            std::thread::sleep(Duration::from_secs(5));
-            if let Err(reason) = check_wlan_ready() {
+            std::thread::sleep(Duration::from_millis(350));
+            if !enabled.load(Ordering::Relaxed) {
                 let _ = publisher.Stop();
-                anyhow::bail!("Adaptador WLAN perdido: {}", reason);
+                if let Ok(mut list) = active_devices.lock() {
+                    list.clear();
+                }
+                info!("Wi-Fi Direct cerrado por el usuario.");
+                return Ok(());
             }
-            if publisher.Status()? == WiFiDirectAdvertisementPublisherStatus::Aborted {
-                anyhow::bail!("El anuncio Wi-Fi Direct fue abortado por el controlador");
+            ticks = ticks.wrapping_add(1);
+            if ticks % 14 == 0 {
+                if let Err(reason) = check_wlan_ready() {
+                    let _ = publisher.Stop();
+                    anyhow::bail!("Adaptador WLAN perdido: {}", reason);
+                }
+                if publisher.Status()? == WiFiDirectAdvertisementPublisherStatus::Aborted {
+                    anyhow::bail!("El anuncio Wi-Fi Direct fue abortado por el controlador");
+                }
             }
         }
     }

@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -46,6 +46,11 @@ pub struct BridgeTcpServer {
     is_paused: AtomicBool,
     disconnect_notify: Arc<Notify>,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    tcp_enabled: Arc<AtomicBool>,
+    wfd_accept_allowed: Arc<AtomicBool>,
+    wfd_host_ip: Arc<StdMutex<Option<String>>>,
+    usb_auto_connect: AtomicBool,
+    usb_active: AtomicBool,
 }
 
 impl BridgeTcpServer {
@@ -80,7 +85,128 @@ impl BridgeTcpServer {
             is_paused: AtomicBool::new(false),
             disconnect_notify: Arc::new(Notify::new()),
             tls_acceptor,
+            tcp_enabled: Arc::new(AtomicBool::new(true)),
+            wfd_accept_allowed: Arc::new(AtomicBool::new(false)),
+            wfd_host_ip: Arc::new(StdMutex::new(None)),
+            usb_auto_connect: AtomicBool::new(true),
+            usb_active: AtomicBool::new(false),
         }
+    }
+
+    pub fn is_tcp_enabled(&self) -> bool {
+        self.tcp_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn is_usb_connected(&self) -> bool {
+        self.usb_active.load(Ordering::Relaxed)
+    }
+
+    pub fn is_usb_auto_connect(&self) -> bool {
+        self.usb_auto_connect.load(Ordering::Relaxed)
+    }
+
+    pub async fn set_usb_auto_connect(&self, enabled: bool) {
+        self.usb_auto_connect.store(enabled, Ordering::Relaxed);
+        self.send_usb_priority_hint(enabled).await;
+    }
+
+    pub async fn send_usb_priority_hint(&self, auto_usb_priority: bool) {
+        let client_tx = {
+            let guard = self.active_client_tx.lock().await;
+            guard.clone()
+        };
+        if let Some(tx) = client_tx {
+            let seq = self.sequence_counter.fetch_add(1, Ordering::SeqCst);
+            let payload = serde_json::json!({ "auto_usb_priority": auto_usb_priority }).to_string();
+            let frame = NfcBridgeFrame::new(MessageType::UsbPriorityHint, seq, payload.into_bytes());
+            let _ = tx.send(frame).await;
+        }
+    }
+
+    pub fn set_wfd_accept_allowed(&self, allowed: bool, wfd_ip: Option<String>) {
+        self.wfd_accept_allowed.store(allowed, Ordering::Relaxed);
+        if let Ok(mut guard) = self.wfd_host_ip.lock() {
+            *guard = wfd_ip;
+        }
+    }
+
+    pub async fn set_tcp_enabled(&self, enabled: bool) {
+        self.tcp_enabled.store(enabled, Ordering::Relaxed);
+        if !enabled {
+            self.disconnect_if_tcp_lan().await;
+        }
+    }
+
+    pub async fn disconnect_if_endpoint_starts_with(&self, prefix: &str) {
+        let matches = {
+            let st = self.runtime_status.lock().await;
+            st.connected
+                && st
+                    .endpoint
+                    .as_deref()
+                    .map(|ep| ep.starts_with(prefix))
+                    .unwrap_or(false)
+        };
+        if matches {
+            self.disconnect_active().await;
+        }
+    }
+
+    pub async fn disconnect_if_tcp_lan(&self) {
+        let matches = {
+            let st = self.runtime_status.lock().await;
+            st.connected
+                && st
+                    .endpoint
+                    .as_deref()
+                    .map(|ep| {
+                        !ep.starts_with("USB-AOA")
+                            && !ep.starts_with("Bluetooth")
+                            && ep != "Cloud Relay"
+                            && !is_wfd_endpoint_str(ep, &self.wfd_host_ip)
+                    })
+                    .unwrap_or(false)
+        };
+        if matches {
+            self.disconnect_active().await;
+        }
+    }
+
+    pub async fn disconnect_if_wfd(&self) {
+        let matches = {
+            let st = self.runtime_status.lock().await;
+            st.connected
+                && st
+                    .endpoint
+                    .as_deref()
+                    .map(|ep| is_wfd_endpoint_str(ep, &self.wfd_host_ip))
+                    .unwrap_or(false)
+        };
+        if matches {
+            self.disconnect_active().await;
+        }
+    }
+
+    fn should_accept_tcp_socket(&self, socket: &TcpStream, peer_addr: SocketAddr) -> bool {
+        if self.tcp_enabled.load(Ordering::Relaxed) {
+            return true;
+        }
+        if !self.wfd_accept_allowed.load(Ordering::Relaxed) {
+            return false;
+        }
+        let peer_ip = peer_addr.ip().to_string();
+        if peer_ip.starts_with("192.168.137.") || peer_ip.starts_with("192.168.49.") {
+            return true;
+        }
+        if let Ok(local) = socket.local_addr() {
+            let local_ip = local.ip().to_string();
+            if let Ok(guard) = self.wfd_host_ip.lock() {
+                if guard.as_deref() == Some(local_ip.as_str()) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub async fn get_status_event(&self) -> IpcEvent {
@@ -155,8 +281,16 @@ impl BridgeTcpServer {
 
         // Iniciar responder UDP en el mismo puerto 45362 para auto-descubrimiento en red Wi-Fi / LAN
         let pc_name = self.pairing.pc_name().to_string();
+        let tcp_enabled_udp = Arc::clone(&self.tcp_enabled);
         tokio::spawn(async move {
-            if let Err(e) = Self::run_udp_discovery_responder(DEFAULT_TCP_PORT, pc_name, cert_fp).await {
+            if let Err(e) = Self::run_udp_discovery_responder(
+                DEFAULT_TCP_PORT,
+                pc_name,
+                cert_fp,
+                tcp_enabled_udp,
+            )
+            .await
+            {
                 warn!("UDP discovery responder en driver finalizó con error: {}", e);
             }
         });
@@ -164,6 +298,14 @@ impl BridgeTcpServer {
         loop {
             match listener.accept().await {
                 Ok((socket, peer_addr)) => {
+                    if !self.should_accept_tcp_socket(&socket, peer_addr) {
+                        debug!(
+                            "Conexión TCP rechazada desde {} (Red Local TCP desactivada)",
+                            peer_addr
+                        );
+                        drop(socket);
+                        continue;
+                    }
                     info!("Dispositivo Android conectado vía TCP desde: {}", peer_addr);
                     let server = Arc::clone(&self);
                     tokio::spawn(async move {
@@ -181,6 +323,7 @@ impl BridgeTcpServer {
         port: u16,
         pc_name: String,
         cert_sha256: Option<String>,
+        tcp_enabled: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         let socket = UdpSocket::bind(addr).await?;
@@ -192,6 +335,9 @@ impl BridgeTcpServer {
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((len, peer_addr)) => {
+                    if !tcp_enabled.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     let msg = String::from_utf8_lossy(&buf[..len]);
                     if msg.contains("NFC_BRIDGE_DISCOVERY") {
                         let pc_id = format!(
@@ -414,6 +560,7 @@ impl BridgeTcpServer {
 
         if authenticated {
             self.is_paused.store(false, Ordering::Relaxed);
+            self.usb_active.store(false, Ordering::Relaxed);
             {
                 let mut active = self.active_client_tx.lock().await;
                 *active = None;
@@ -615,6 +762,8 @@ impl BridgeTcpServer {
         out_tx: &mpsc::Sender<NfcBridgeFrame>,
     ) {
         let name = device_name.unwrap_or_else(|| "Android Phone".to_string());
+        self.usb_active
+            .store(peer_endpoint.starts_with("USB-AOA"), Ordering::Relaxed);
         {
             let mut st = self.runtime_status.lock().await;
             st.connected = true;
@@ -640,7 +789,36 @@ impl BridgeTcpServer {
             ack_obj.to_string().into_bytes(),
         );
         let _ = out_tx.send(ack_frame).await;
+
+        let hint_seq = self.sequence_counter.fetch_add(1, Ordering::SeqCst);
+        let hint_payload = serde_json::json!({
+            "auto_usb_priority": self.usb_auto_connect.load(Ordering::Relaxed)
+        })
+        .to_string();
+        let hint_frame = NfcBridgeFrame::new(
+            MessageType::UsbPriorityHint,
+            hint_seq,
+            hint_payload.into_bytes(),
+        );
+        let _ = out_tx.send(hint_frame).await;
     }
+}
+
+fn is_wfd_endpoint_str(endpoint: &str, wfd_host_ip: &StdMutex<Option<String>>) -> bool {
+    if endpoint.starts_with("192.168.137.") || endpoint.starts_with("192.168.49.") {
+        return true;
+    }
+    if let (Some(ip), Ok(guard)) = (endpoint.split(':').next(), wfd_host_ip.lock()) {
+        if let Some(host_ip) = guard.as_deref() {
+            if let (Some(prefix), Some(peer_prefix)) = (
+                host_ip.rsplit_once('.').map(|(p, _)| p),
+                ip.rsplit_once('.').map(|(p, _)| p),
+            ) {
+                return prefix == peer_prefix;
+            }
+        }
+    }
+    false
 }
 
 fn parse_device_state_paused(payload: &[u8]) -> Option<bool> {

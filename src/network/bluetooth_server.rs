@@ -4,13 +4,17 @@
 //! (`AF_BTH` / `BTHPROTO_RFCOMM` + registro SDP vía `WSASetServiceW`) sin depender de
 //! Sync ni de puertos COM virtuales manuales.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::network::BridgeTcpServer;
 
 pub struct BluetoothRfcommServer {
     coordinator: Arc<BridgeTcpServer>,
+    enabled: Arc<AtomicBool>,
+    wake_notify: Arc<Notify>,
 }
 
 /// Devuelve `(MAC, Nombre)` del radio Bluetooth local en Windows si está disponible.
@@ -27,7 +31,20 @@ pub fn get_local_bluetooth_info() -> Option<(String, String)> {
 
 impl BluetoothRfcommServer {
     pub fn new(coordinator: Arc<BridgeTcpServer>) -> Self {
-        Self { coordinator }
+        Self {
+            coordinator,
+            enabled: Arc::new(AtomicBool::new(true)),
+            wake_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+        self.wake_notify.notify_waiters();
     }
 
     pub async fn run(self: Arc<Self>) {
@@ -37,13 +54,24 @@ impl BluetoothRfcommServer {
             let mut logged_unavailable = false;
 
             loop {
+                if !self.enabled.load(Ordering::Relaxed) {
+                    self.wake_notify.notified().await;
+                    logged_unavailable = false;
+                    continue;
+                }
+
                 let coordinator = Arc::clone(&self.coordinator);
                 let rt_handle = tokio::runtime::Handle::current();
+                let enabled_flag = Arc::clone(&self.enabled);
 
                 let res = tokio::task::spawn_blocking(move || {
-                    windows_bt::run_rfcomm_listener(coordinator, rt_handle)
+                    windows_bt::run_rfcomm_listener(coordinator, rt_handle, enabled_flag)
                 })
                 .await;
+
+                if !self.enabled.load(Ordering::Relaxed) {
+                    continue;
+                }
 
                 match res {
                     Ok(Ok(())) => {
@@ -66,13 +94,16 @@ impl BluetoothRfcommServer {
                     }
                 }
 
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::select! {
+                    _ = self.wake_notify.notified() => {},
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {},
+                }
             }
         }
 
         #[cfg(not(windows))]
         {
-            let _ = &self.coordinator;
+            let _ = (&self.coordinator, &self.enabled, &self.wake_notify);
             warn!("Servidor Bluetooth RFCOMM solo soportado en Windows.");
         }
     }
@@ -243,6 +274,7 @@ mod windows_bt {
     pub fn run_rfcomm_listener(
         coordinator: Arc<BridgeTcpServer>,
         rt_handle: tokio::runtime::Handle,
+        enabled: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
         unsafe {
             let (radio_guard, radio_addr) = open_primary_radio()?;
@@ -333,13 +365,19 @@ mod windows_bt {
                 format_bt_mac(radio_addr)
             );
 
+            let mut idle_cycles: u32 = 0;
             loop {
+                if !enabled.load(Ordering::Relaxed) {
+                    info!("Bluetooth RFCOMM SPP desactivado por el usuario.");
+                    return Ok(());
+                }
+
                 let mut read_fds: FD_SET = zeroed();
                 read_fds.fd_count = 1;
                 read_fds.fd_array[0] = listen_guard.0;
                 let timeout = TIMEVAL {
-                    tv_sec: 2,
-                    tv_usec: 0,
+                    tv_sec: 0,
+                    tv_usec: 350_000,
                 };
 
                 let ready = select(0, &mut read_fds, null_mut(), null_mut(), &timeout);
@@ -350,16 +388,20 @@ mod windows_bt {
                 }
 
                 if ready == 0 {
-                    // Si BTHUSB reinicia el dongle, accept() puede quedar colgado sin error pero el handle del radio falla.
-                    if let Err(reason) = check_radio_healthy(&radio_guard, radio_addr) {
-                        warn!(
-                            "Radio Bluetooth inválido o reiniciado ({}); reconstruyendo socket y SDP...",
-                            reason
-                        );
-                        anyhow::bail!("Radio Bluetooth reiniciado: {}", reason);
+                    idle_cycles = idle_cycles.wrapping_add(1);
+                    if idle_cycles % 6 == 0 {
+                        // Si BTHUSB reinicia el dongle, accept() puede quedar colgado sin error pero el handle del radio falla.
+                        if let Err(reason) = check_radio_healthy(&radio_guard, radio_addr) {
+                            warn!(
+                                "Radio Bluetooth inválido o reiniciado ({}); reconstruyendo socket y SDP...",
+                                reason
+                            );
+                            anyhow::bail!("Radio Bluetooth reiniciado: {}", reason);
+                        }
                     }
                     continue;
                 }
+                idle_cycles = 0;
 
                 let mut remote_addr: SOCKADDR_BTH = zeroed();
                 let mut remote_len = size_of::<SOCKADDR_BTH>() as i32;

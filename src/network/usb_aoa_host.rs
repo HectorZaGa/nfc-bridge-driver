@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use rusb::{Context, Device, Direction, Recipient, RequestType, TransferType, UsbContext};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::network::BridgeTcpServer;
@@ -61,11 +62,45 @@ struct UsbBackend {
 
 pub struct UsbAoaHost {
     coordinator: Arc<BridgeTcpServer>,
+    enabled: AtomicBool,
+    auto_connect: AtomicBool,
+    reset_attempted: AtomicBool,
+    wake_notify: Notify,
 }
 
 impl UsbAoaHost {
     pub fn new(coordinator: Arc<BridgeTcpServer>) -> Self {
-        Self { coordinator }
+        Self {
+            coordinator,
+            enabled: AtomicBool::new(true),
+            auto_connect: AtomicBool::new(true),
+            reset_attempted: AtomicBool::new(false),
+            wake_notify: Notify::new(),
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+        if enabled {
+            self.reset_attempted.store(true, Ordering::Relaxed);
+        }
+        self.wake_notify.notify_waiters();
+    }
+
+    pub fn is_auto_connect(&self) -> bool {
+        self.auto_connect.load(Ordering::Relaxed)
+    }
+
+    pub fn set_auto_connect(&self, auto_connect: bool) {
+        self.auto_connect.store(auto_connect, Ordering::Relaxed);
+        if auto_connect {
+            self.reset_attempted.store(true, Ordering::Relaxed);
+        }
+        self.wake_notify.notify_waiters();
     }
 
     fn init_usb_backend(_warn_if_missing_usbdk: bool) -> anyhow::Result<UsbBackend> {
@@ -86,6 +121,15 @@ impl UsbAoaHost {
         let mut attempted_devices: HashSet<UsbDeviceKey> = HashSet::new();
 
         loop {
+            if !self.enabled.load(Ordering::Relaxed) {
+                attempted_devices.clear();
+                self.wake_notify.notified().await;
+                continue;
+            }
+            if self.reset_attempted.swap(false, Ordering::Relaxed) {
+                attempted_devices.clear();
+            }
+
             let need_usbdk_upgrade = backend
                 .as_ref()
                 .map(|b| !b.using_usbdk && last_usbdk_retry.elapsed() >= Duration::from_secs(10))
@@ -115,12 +159,17 @@ impl UsbAoaHost {
             }
 
             if let Some(ref b) = backend {
-                if let Err(e) = self.scan_and_connect(&b.ctx, &mut attempted_devices).await {
-                    debug!("Ciclo de escaneo USB AOA: {}", e);
+                if self.enabled.load(Ordering::Relaxed) {
+                    if let Err(e) = self.scan_and_connect(&b.ctx, &mut attempted_devices).await {
+                        debug!("Ciclo de escaneo USB AOA: {}", e);
+                    }
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::select! {
+                _ = self.wake_notify.notified() => {},
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {},
+            }
         }
     }
 
@@ -174,8 +223,9 @@ impl UsbAoaHost {
             }
         }
 
-        // 2. Intentar negociación AOA una vez por conexión física/modo en Android compatibles
-        for (dev, key) in android_candidates {
+        // 2. Intentar negociación AOA una vez por conexión física/modo en Android compatibles si auto-conectar está activo
+        if self.auto_connect.load(Ordering::Relaxed) {
+            for (dev, key) in android_candidates {
             if attempted_devices.contains(&key) {
                 continue;
             }
@@ -201,6 +251,7 @@ impl UsbAoaHost {
                 Err(e) => {
                     debug!("Error en tarea bloqueante AOA ({:04X}:{:04X}): {}", vid, pid, e);
                 }
+            }
             }
         }
 
