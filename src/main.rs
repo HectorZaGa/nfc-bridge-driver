@@ -30,6 +30,82 @@ fn run_hidden_command(program: &str, args: &[&str]) -> std::io::Result<std::proc
     cmd.status()
 }
 
+fn replace_previous_driver_processes() -> Result<usize, usize> {
+    #[cfg(windows)]
+    {
+        use std::mem::{size_of, zeroed};
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+            PROCESS_TERMINATE,
+        };
+
+        let self_pid = std::process::id();
+        let mut killed = 0usize;
+        let mut unremovable = 0usize;
+
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == INVALID_HANDLE_VALUE {
+                return Ok(0);
+            }
+
+            let mut entry: PROCESSENTRY32W = zeroed();
+            entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+
+            if Process32FirstW(snap, &mut entry) != 0 {
+                loop {
+                    let pid = entry.th32ProcessID;
+                    if pid != 0 && pid != self_pid {
+                        let end = entry
+                            .szExeFile
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(entry.szExeFile.len());
+                        let exe_name = String::from_utf16_lossy(&entry.szExeFile[..end])
+                            .to_lowercase();
+
+                        if exe_name.starts_with("nfc-bridge-driver") {
+                            let proc_handle =
+                                OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
+                            if proc_handle.is_null() {
+                                unremovable += 1;
+                            } else {
+                                if TerminateProcess(proc_handle, 0) != 0 {
+                                    let _ = WaitForSingleObject(proc_handle, 2000);
+                                    killed += 1;
+                                } else {
+                                    unremovable += 1;
+                                }
+                                let _ = CloseHandle(proc_handle);
+                            }
+                        }
+                    }
+                    if Process32NextW(snap, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+
+            let _ = CloseHandle(snap);
+        }
+
+        if unremovable > 0 {
+            Err(unremovable)
+        } else {
+            Ok(killed)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(0)
+    }
+}
+
 fn handle_cli_commands() -> Option<anyhow::Result<()>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() <= 1 {
@@ -61,6 +137,8 @@ fn handle_cli_commands() -> Option<anyhow::Result<()>> {
 
             let status = if service_exists {
                 let _ = run_hidden_command("sc.exe", &["stop", "NfcBridgeDriver"]);
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let _ = replace_previous_driver_processes();
                 run_hidden_command(
                     "sc.exe",
                     &[
@@ -72,6 +150,7 @@ fn handle_cli_commands() -> Option<anyhow::Result<()>> {
                     ],
                 )
             } else {
+                let _ = replace_previous_driver_processes();
                 run_hidden_command(
                     "sc.exe",
                     &[
@@ -106,6 +185,8 @@ fn handle_cli_commands() -> Option<anyhow::Result<()>> {
         }
         "--uninstall-service" => {
             let _ = run_hidden_command("sc.exe", &["stop", "NfcBridgeDriver"]);
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let _ = replace_previous_driver_processes();
             let status = run_hidden_command("sc.exe", &["delete", "NfcBridgeDriver"]);
             match status {
                 Ok(s) if s.success() => Some(Ok(())),
@@ -180,6 +261,24 @@ async fn run_driver(shutdown: Option<Arc<Notify>>, log_to_file: bool) -> anyhow:
     std::panic::set_hook(Box::new(|panic_info| {
         tracing::error!("PANIC crítico en NFC Bridge Driver: {}", panic_info);
     }));
+
+    match replace_previous_driver_processes() {
+        Ok(killed) if killed > 0 => {
+            info!(
+                "Se cerraron {} instancia(s) previa(s) del driver para activar esta versión.",
+                killed
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        Err(unremovable) => {
+            warn!(
+                "Existe {} instancia(s) privilegiada(s) o de servicio activa(s) que no pueden reemplazarse sin elevar permisos; cerrando copia duplicada.",
+                unremovable
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
 
     if is_another_driver_instance_active() {
         warn!("Ya existe otra instancia activa de NFC Bridge Driver en el sistema; cerrando duplicado.");
