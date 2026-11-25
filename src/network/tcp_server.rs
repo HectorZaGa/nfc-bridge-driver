@@ -31,6 +31,7 @@ pub struct DriverRuntimeStatus {
     pub endpoint: Option<String>,
     pub transport: Option<String>,
     pub mobile_id: Option<String>,
+    pub device_os: Option<String>,
     pub active_device_id: Option<String>,
     pub latency_ms: u64,
     pub paused: bool,
@@ -239,6 +240,7 @@ impl BridgeTcpServer {
             tag_uid: st.tag_uid.clone(),
             transport: st.transport.clone(),
             mobile_id: st.mobile_id.clone(),
+            device_os: st.device_os.clone(),
             active_device_id: st.active_device_id.clone(),
         }
     }
@@ -594,6 +596,7 @@ impl BridgeTcpServer {
                 st.endpoint = None;
                 st.transport = None;
                 st.mobile_id = None;
+                st.device_os = None;
                 st.active_device_id = None;
                 st.paused = false;
                 st.tag_present = false;
@@ -662,6 +665,7 @@ impl BridgeTcpServer {
                             Some(new_device_token),
                             Some(auth_res.transport),
                             auth_res.mobile_id,
+                            Some(auth_res.device_os),
                             auth_res.device_id,
                             phone_paused,
                             &pc_name,
@@ -680,6 +684,7 @@ impl BridgeTcpServer {
                             None,
                             Some(auth_res.transport),
                             auth_res.mobile_id,
+                            Some(auth_res.device_os),
                             auth_res.device_id,
                             phone_paused,
                             &pc_name,
@@ -792,6 +797,7 @@ impl BridgeTcpServer {
         new_device_token: Option<String>,
         transport: Option<String>,
         mobile_id: Option<String>,
+        device_os: Option<String>,
         active_device_id: Option<String>,
         phone_paused: bool,
         pc_name: &str,
@@ -799,7 +805,13 @@ impl BridgeTcpServer {
         sequence_id: u16,
         out_tx: &mpsc::Sender<NfcBridgeFrame>,
     ) {
-        let name = device_name.unwrap_or_else(|| "Android Phone".to_string());
+        let name = device_name.unwrap_or_else(|| {
+            if device_os.as_deref() == Some("ios") {
+                "iPhone".to_string()
+            } else {
+                "Android Phone".to_string()
+            }
+        });
         self.usb_active
             .store(peer_endpoint.starts_with("USB-AOA"), Ordering::Relaxed);
         {
@@ -809,6 +821,7 @@ impl BridgeTcpServer {
             st.endpoint = Some(peer_endpoint.to_string());
             st.transport = transport;
             st.mobile_id = mobile_id;
+            st.device_os = device_os;
             st.active_device_id = active_device_id;
         }
         self.apply_pause_state(phone_paused).await;

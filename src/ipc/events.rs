@@ -10,6 +10,8 @@ pub struct TrustedDeviceInfo {
     #[serde(default)]
     pub mobile_id: Option<String>,
     #[serde(default)]
+    pub device_os: Option<String>,
+    #[serde(default)]
     pub transport: Option<String>,
     #[serde(default)]
     pub endpoint: Option<String>,
@@ -54,6 +56,8 @@ pub enum IpcEvent {
         transport: Option<String>,
         #[serde(default)]
         mobile_id: Option<String>,
+        #[serde(default)]
+        device_os: Option<String>,
         #[serde(default)]
         active_device_id: Option<String>,
     },

@@ -26,6 +26,8 @@ pub struct TrustedDevice {
     #[serde(default)]
     pub mobile_id: Option<String>,
     #[serde(default)]
+    pub device_os: Option<String>,
+    #[serde(default)]
     pub transport: Option<String>,
     #[serde(default)]
     pub endpoint: Option<String>,
@@ -45,6 +47,8 @@ struct HelloSynPayload {
     #[serde(default)]
     mobile_id: Option<String>,
     #[serde(default)]
+    device_os: Option<String>,
+    #[serde(default)]
     transport: Option<String>,
     #[serde(default)]
     pair_token: Option<String>,
@@ -59,6 +63,7 @@ pub struct HelloAuthResult {
     pub outcome: HelloAuthOutcome,
     pub device_id: Option<String>,
     pub mobile_id: Option<String>,
+    pub device_os: String,
     pub transport: String,
 }
 
@@ -243,6 +248,7 @@ impl PairingManager {
                 outcome,
                 device_id: None,
                 mobile_id: None,
+                device_os: "android".to_string(),
                 transport: default_transport,
             };
         }
@@ -259,6 +265,7 @@ impl PairingManager {
                 outcome,
                 device_id: None,
                 mobile_id: None,
+                device_os: "android".to_string(),
                 transport: default_transport,
             };
         };
@@ -271,6 +278,7 @@ impl PairingManager {
             .mobile_id
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let device_os = normalize_device_os(parsed.device_os.as_deref());
         let transport = parsed
             .transport
             .as_deref()
@@ -293,10 +301,16 @@ impl PairingManager {
             };
 
             if valid {
-                let device_label = clean_name.clone().unwrap_or_else(|| "Android Phone".to_string());
+                let fallback_label = if device_os == "ios" {
+                    "iPhone"
+                } else {
+                    "Android Phone"
+                };
+                let device_label = clean_name.clone().unwrap_or_else(|| fallback_label.to_string());
                 let (permanent, effective_name) = self.upsert_trusted_device(
                     &device_label,
                     mobile_id.clone(),
+                    Some(device_os.clone()),
                     Some(transport.clone()),
                     endpoint_opt,
                     None,
@@ -309,6 +323,7 @@ impl PairingManager {
                     },
                     device_id,
                     mobile_id,
+                    device_os,
                     transport,
                 };
             }
@@ -324,6 +339,7 @@ impl PairingManager {
                         dev_tok,
                         clean_name.as_ref(),
                         mobile_id.as_ref(),
+                        Some(&device_os),
                         Some(&transport),
                         endpoint_opt.as_deref(),
                     ) {
@@ -333,6 +349,7 @@ impl PairingManager {
                             },
                             device_id: Some(device_id),
                             mobile_id,
+                            device_os,
                             transport,
                         };
                     }
@@ -345,6 +362,7 @@ impl PairingManager {
                 },
                 device_id: None,
                 mobile_id,
+                device_os,
                 transport,
             };
         }
@@ -359,6 +377,7 @@ impl PairingManager {
                 dev_tok,
                 clean_name.as_ref(),
                 mobile_id.as_ref(),
+                Some(&device_os),
                 Some(&transport),
                 endpoint_opt.as_deref(),
             ) {
@@ -368,6 +387,7 @@ impl PairingManager {
                     },
                     device_id: Some(device_id),
                     mobile_id,
+                    device_os,
                     transport,
                 };
             }
@@ -377,6 +397,7 @@ impl PairingManager {
                 },
                 device_id: None,
                 mobile_id,
+                device_os,
                 transport,
             };
         }
@@ -388,12 +409,14 @@ impl PairingManager {
                 },
                 device_id: None,
                 mobile_id,
+                device_os,
                 transport,
             }
         } else if let Some(ref label) = clean_name {
             let (permanent, effective_name) = self.upsert_trusted_device(
                 label,
                 mobile_id.clone(),
+                Some(device_os.clone()),
                 Some(transport.clone()),
                 endpoint_opt,
                 None,
@@ -406,6 +429,7 @@ impl PairingManager {
                 },
                 device_id,
                 mobile_id,
+                device_os,
                 transport,
             }
         } else {
@@ -415,6 +439,7 @@ impl PairingManager {
                 },
                 device_id: None,
                 mobile_id,
+                device_os,
                 transport,
             }
         }
@@ -435,6 +460,7 @@ impl PairingManager {
                     .to_string(),
                 created_unix: d.created_unix,
                 mobile_id: d.mobile_id.clone(),
+                device_os: d.device_os.clone(),
                 transport: d.transport.clone(),
                 endpoint: d.endpoint.clone(),
             })
@@ -460,6 +486,7 @@ impl PairingManager {
         &self,
         device_label: &str,
         mobile_id: Option<String>,
+        device_os: Option<String>,
         transport: Option<String>,
         endpoint: Option<String>,
         preferred_token: Option<String>,
@@ -493,6 +520,9 @@ impl PairingManager {
             if mobile_id.is_some() {
                 existing.mobile_id = mobile_id;
             }
+            if device_os.is_some() {
+                existing.device_os = device_os;
+            }
             if transport.is_some() {
                 existing.transport = transport;
             }
@@ -511,6 +541,7 @@ impl PairingManager {
                 device_name: device_label.to_string(),
                 created_unix: unix_now_secs(),
                 mobile_id,
+                device_os,
                 transport,
                 endpoint,
                 custom_name: None,
@@ -527,6 +558,7 @@ impl PairingManager {
         dev_tok: &str,
         clean_name: Option<&String>,
         mobile_id: Option<&String>,
+        device_os: Option<&str>,
         transport: Option<&str>,
         endpoint: Option<&str>,
     ) -> Option<(String, String)> {
@@ -562,6 +594,12 @@ impl PairingManager {
         if let Some(mid) = mobile_id {
             if found.mobile_id.as_deref() != Some(mid.as_str()) {
                 found.mobile_id = Some(mid.clone());
+                dirty = true;
+            }
+        }
+        if let Some(os) = device_os {
+            if found.device_os.as_deref() != Some(os) {
+                found.device_os = Some(os.to_string());
                 dirty = true;
             }
         }
@@ -737,6 +775,22 @@ fn normalize_transport_name(raw: &str) -> String {
         "wifi_direct".to_string()
     } else {
         "tcp".to_string()
+    }
+}
+
+fn normalize_device_os(raw: Option<&str>) -> String {
+    let Some(val) = raw else {
+        return "android".to_string();
+    };
+    let lower = val.trim().to_lowercase();
+    if lower.contains("ios")
+        || lower.contains("iphone")
+        || lower.contains("ipad")
+        || lower.contains("apple")
+    {
+        "ios".to_string()
+    } else {
+        "android".to_string()
     }
 }
 
@@ -1161,6 +1215,45 @@ mod tests {
             mgr.validate_hello_payload_for_transport(stale_local.as_bytes(), true),
             HelloAuthOutcome::Rejected { .. }
         ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_device_os_normalization_and_persistence() {
+        let dir = temp_dir("device_os_meta");
+        let mgr = PairingManager::with_data_dir(dir.clone(), "HECTOR-MASTER".to_string());
+
+        let (tok_ios, _) = mgr.issue_ephemeral_token();
+        let syn_ios = format!(
+            r#"{{"device_name":"iPhone de Hector","mobile_id":"IOS1-2222-3333","device_os":"iOS","transport":"relay","pair_token":"{}"}}"#,
+            tok_ios
+        );
+        let res_ios = mgr.validate_hello_payload_with_meta(
+            syn_ios.as_bytes(),
+            true,
+            "relay",
+            "wss://relay.example/nb-1",
+        );
+        assert_eq!(res_ios.device_os, "ios");
+
+        let (tok_and, _) = mgr.issue_ephemeral_token();
+        let syn_and = format!(
+            r#"{{"device_name":"Pixel","mobile_id":"AND1-2222-3333","device_os":"Android","transport":"tcp","pair_token":"{}"}}"#,
+            tok_and
+        );
+        let res_and = mgr.validate_hello_payload_with_meta(
+            syn_and.as_bytes(),
+            false,
+            "tcp",
+            "192.168.15.2:50000",
+        );
+        assert_eq!(res_and.device_os, "android");
+
+        let listed = mgr.list_trusted_devices();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].device_os.as_deref(), Some("ios"));
+        assert_eq!(listed[1].device_os.as_deref(), Some("android"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
