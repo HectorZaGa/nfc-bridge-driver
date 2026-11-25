@@ -485,7 +485,7 @@ fn load_or_create_host_secret(path: &PathBuf) -> String {
     secret
 }
 
-const DEFAULT_OFFICIAL_RELAY_URL: &str = "https://nfc-bridge-relay.hectorzaga96.workers.dev";
+const BUILTIN_DEFAULT_RELAY_URL: &str = "https://nfc-bridge.hectorzaga96.workers.dev";
 
 fn load_relay_url(path: &PathBuf) -> Option<String> {
     if let Ok(env_url) = std::env::var("NFC_BRIDGE_RELAY_URL") {
@@ -503,9 +503,8 @@ fn load_relay_url(path: &PathBuf) -> Option<String> {
     {
         return Some(saved);
     }
-    option_env!("NFC_BRIDGE_DEFAULT_RELAY_URL")
-        .or(Some(DEFAULT_OFFICIAL_RELAY_URL))
-        .map(|s| s.trim().trim_end_matches('/').to_string())
+    let default_url = option_env!("NFC_BRIDGE_DEFAULT_RELAY_URL").unwrap_or(BUILTIN_DEFAULT_RELAY_URL);
+    Some(default_url.trim().trim_end_matches('/').to_string())
         .filter(|s| is_allowed_relay_url(s))
 }
 
