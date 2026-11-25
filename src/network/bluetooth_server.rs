@@ -75,12 +75,17 @@ mod windows_bt {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tracing::{debug, info, warn};
     use windows_sys::core::GUID;
-    use windows_sys::Win32::Devices::Bluetooth::{AF_BTH, BTHPROTO_RFCOMM, NS_BTH, SOCKADDR_BTH};
+    use windows_sys::Win32::Devices::Bluetooth::{
+        BluetoothFindFirstRadio, BluetoothFindRadioClose, BluetoothGetRadioInfo,
+        BluetoothIsConnectable, AF_BTH, BLUETOOTH_FIND_RADIO_PARAMS, BLUETOOTH_RADIO_INFO,
+        BTHPROTO_RFCOMM, NS_BTH, SOCKADDR_BTH,
+    };
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE};
     use windows_sys::Win32::Networking::WinSock::{
-        accept, bind, closesocket, getsockname, listen, recv, send, setsockopt, shutdown, socket,
-        WSAGetLastError, WSASetServiceW, WSAStartup, CSADDR_INFO, INVALID_SOCKET, RNRSERVICE_DELETE,
-        RNRSERVICE_REGISTER, SD_BOTH, SOCKADDR, SOCKET, SOCKET_ADDRESS, SOCKET_ERROR, SOCK_STREAM,
-        SOL_SOCKET, SO_RCVTIMEO, WSADATA, WSAQUERYSETW,
+        accept, bind, closesocket, getsockname, listen, recv, select, send, setsockopt, shutdown,
+        socket, WSAGetLastError, WSASetServiceW, WSAStartup, CSADDR_INFO, FD_SET, INVALID_SOCKET,
+        RNRSERVICE_DELETE, RNRSERVICE_REGISTER, SD_BOTH, SOCKADDR, SOCKET, SOCKET_ADDRESS,
+        SOCKET_ERROR, SOCK_STREAM, SOL_SOCKET, SO_RCVTIMEO, TIMEVAL, WSADATA, WSAQUERYSETW,
     };
 
     use crate::network::BridgeTcpServer;
@@ -103,6 +108,84 @@ mod windows_bt {
         }
     }
 
+    struct RadioHandleGuard(HANDLE);
+
+    impl Drop for RadioHandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    struct SdpRegistrationGuard(*const WSAQUERYSETW);
+
+    impl Drop for SdpRegistrationGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    let _ = WSASetServiceW(self.0, RNRSERVICE_DELETE, 0);
+                }
+            }
+        }
+    }
+
+    /// Obtiene el handle del primer radio Bluetooth local y su dirección MAC (`ullLong`).
+    unsafe fn open_primary_radio() -> anyhow::Result<(RadioHandleGuard, u64)> {
+        let params = BLUETOOTH_FIND_RADIO_PARAMS {
+            dwSize: size_of::<BLUETOOTH_FIND_RADIO_PARAMS>() as u32,
+        };
+        let mut raw_radio: HANDLE = null_mut();
+        let find_handle = BluetoothFindFirstRadio(&params, &mut raw_radio);
+        if find_handle.is_null() {
+            anyhow::bail!("No se encontró radio Bluetooth local activo");
+        }
+        let _ = BluetoothFindRadioClose(find_handle);
+
+        let radio_guard = RadioHandleGuard(raw_radio);
+        let mut radio_info: BLUETOOTH_RADIO_INFO = zeroed();
+        radio_info.dwSize = size_of::<BLUETOOTH_RADIO_INFO>() as u32;
+        let status = BluetoothGetRadioInfo(radio_guard.0, &mut radio_info);
+        if status != ERROR_SUCCESS {
+            anyhow::bail!("BluetoothGetRadioInfo inicial falló (código {})", status);
+        }
+        if BluetoothIsConnectable(radio_guard.0) == 0 {
+            anyhow::bail!("Radio Bluetooth local encontrado, pero no está conectable aún");
+        }
+
+        Ok((radio_guard, radio_info.address.Anonymous.ullLong))
+    }
+
+    /// Verifica que el radio Bluetooth siga activo y no haya sufrido un reinicio de pila (p. ej. BTHUSB).
+    unsafe fn check_radio_healthy(
+        radio_guard: &RadioHandleGuard,
+        expected_addr: u64,
+    ) -> Result<(), String> {
+        let mut radio_info: BLUETOOTH_RADIO_INFO = zeroed();
+        radio_info.dwSize = size_of::<BLUETOOTH_RADIO_INFO>() as u32;
+        let status = BluetoothGetRadioInfo(radio_guard.0, &mut radio_info);
+        if status != ERROR_SUCCESS {
+            return Err(format!("BluetoothGetRadioInfo falló (código {})", status));
+        }
+
+        let current_addr = radio_info.address.Anonymous.ullLong;
+        if current_addr != expected_addr {
+            return Err(format!(
+                "Dirección del radio Bluetooth cambió ({} -> {})",
+                format_bt_mac(expected_addr),
+                format_bt_mac(current_addr)
+            ));
+        }
+
+        if BluetoothIsConnectable(radio_guard.0) == 0 {
+            return Err("El radio Bluetooth dejó de aceptar conexiones entrantes".to_string());
+        }
+
+        Ok(())
+    }
+
     fn format_bt_mac(addr: u64) -> String {
         format!(
             "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
@@ -120,6 +203,8 @@ mod windows_bt {
         rt_handle: tokio::runtime::Handle,
     ) -> anyhow::Result<()> {
         unsafe {
+            let (radio_guard, radio_addr) = open_primary_radio()?;
+
             let mut wsa_data: WSADATA = zeroed();
             let wsa_res = WSAStartup(0x0202, &mut wsa_data);
             if wsa_res != 0 {
@@ -196,14 +281,44 @@ mod windows_bt {
             if WSASetServiceW(&query_set, RNRSERVICE_REGISTER, 0) == SOCKET_ERROR {
                 anyhow::bail!("WSASetServiceW(REGISTER) falló (WSA {})", WSAGetLastError());
             }
+            // Declarado después de query_set y sus buffers para garantizar RNRSERVICE_DELETE antes de liberarlos.
+            let _sdp_guard = SdpRegistrationGuard(&query_set);
 
             let rfcomm_port = bind_addr.port;
             info!(
-                "Driver Bluetooth RFCOMM SPP escuchando en canal {} (UUID: 4E464342-5249-4447-452D-535050303031)",
-                rfcomm_port
+                "Driver Bluetooth RFCOMM SPP escuchando en canal {} (radio {}, UUID: 4E464342-5249-4447-452D-535050303031)",
+                rfcomm_port,
+                format_bt_mac(radio_addr)
             );
 
             loop {
+                let mut read_fds: FD_SET = zeroed();
+                read_fds.fd_count = 1;
+                read_fds.fd_array[0] = listen_guard.0;
+                let timeout = TIMEVAL {
+                    tv_sec: 2,
+                    tv_usec: 0,
+                };
+
+                let ready = select(0, &mut read_fds, null_mut(), null_mut(), &timeout);
+                if ready == SOCKET_ERROR {
+                    let err = WSAGetLastError();
+                    warn!("select(AF_BTH) finalizado (WSA {})", err);
+                    anyhow::bail!("select Bluetooth detenido (WSA {})", err);
+                }
+
+                if ready == 0 {
+                    // Si BTHUSB reinicia el dongle, accept() puede quedar colgado sin error pero el handle del radio falla.
+                    if let Err(reason) = check_radio_healthy(&radio_guard, radio_addr) {
+                        warn!(
+                            "Radio Bluetooth inválido o reiniciado ({}); reconstruyendo socket y SDP...",
+                            reason
+                        );
+                        anyhow::bail!("Radio Bluetooth reiniciado: {}", reason);
+                    }
+                    continue;
+                }
+
                 let mut remote_addr: SOCKADDR_BTH = zeroed();
                 let mut remote_len = size_of::<SOCKADDR_BTH>() as i32;
                 let client_sock = accept(
@@ -215,7 +330,6 @@ mod windows_bt {
                 if client_sock == INVALID_SOCKET {
                     let err = WSAGetLastError();
                     warn!("accept(AF_BTH) finalizado (WSA {})", err);
-                    let _ = WSASetServiceW(&query_set, RNRSERVICE_DELETE, 0);
                     anyhow::bail!("accept Bluetooth detenido (WSA {})", err);
                 }
 
