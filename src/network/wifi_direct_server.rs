@@ -76,6 +76,18 @@ impl WifiDirectServer {
         }
     }
 
+    pub fn current_snapshot(&self) -> WifiDirectRuntimeInfo {
+        self.state
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| {
+                WifiDirectRuntimeInfo::unavailable(
+                    "NFC-Bridge-PC".to_string(),
+                    "Estado bloqueado".to_string(),
+                )
+            })
+    }
+
     pub fn get_status_event(&self) -> IpcEvent {
         match self.state.lock() {
             Ok(guard) => guard.to_ipc_event(),

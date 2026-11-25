@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::emulator::CcidHandler;
 use crate::ipc::events::IpcEvent;
+use crate::network::pairing_manager::{HelloAuthOutcome, PairingManager};
 use crate::protocol::codec::{FrameCodec, StreamFrameDecoder};
 use crate::protocol::constants::DEFAULT_TCP_PORT;
 use crate::protocol::crc::compute_crc16;
@@ -36,6 +37,7 @@ pub struct DriverRuntimeStatus {
 pub struct BridgeTcpServer {
     event_tx: broadcast::Sender<IpcEvent>,
     ccid_handler: Arc<Mutex<CcidHandler>>,
+    pairing: Arc<PairingManager>,
     sequence_counter: AtomicU16,
     active_client_tx: Arc<Mutex<Option<mpsc::Sender<NfcBridgeFrame>>>>,
     pending_transceive: Arc<Mutex<Option<(u16, oneshot::Sender<Vec<u8>>)>>>,
@@ -46,9 +48,19 @@ pub struct BridgeTcpServer {
 
 impl BridgeTcpServer {
     pub fn new(event_tx: broadcast::Sender<IpcEvent>, ccid_handler: Arc<Mutex<CcidHandler>>) -> Self {
+        let pc_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "NFC Bridge PC".to_string());
+        Self::with_pairing(event_tx, ccid_handler, Arc::new(PairingManager::new(pc_name)))
+    }
+
+    pub fn with_pairing(
+        event_tx: broadcast::Sender<IpcEvent>,
+        ccid_handler: Arc<Mutex<CcidHandler>>,
+        pairing: Arc<PairingManager>,
+    ) -> Self {
         Self {
             event_tx,
             ccid_handler,
+            pairing,
             sequence_counter: AtomicU16::new(1),
             active_client_tx: Arc::new(Mutex::new(None)),
             pending_transceive: Arc::new(Mutex::new(None)),
@@ -90,6 +102,21 @@ impl BridgeTcpServer {
 
     pub async fn disconnect_active(&self) {
         self.disconnect_notify.notify_waiters();
+    }
+
+    async fn update_connected_device_name(&self, device_name: Option<String>) {
+        let Some(name) = device_name else {
+            return;
+        };
+        let endpoint = {
+            let mut st = self.runtime_status.lock().await;
+            st.device_name = Some(name.clone());
+            st.endpoint.clone().unwrap_or_default()
+        };
+        let _ = self.event_tx.send(IpcEvent::DeviceConnected {
+            device_name: name,
+            endpoint,
+        });
     }
 
     /// Inicia el listener TCP y el responder UDP de auto-descubrimiento en el puerto 45362.
@@ -348,15 +375,65 @@ impl BridgeTcpServer {
     ) {
         match frame.message_type {
             MessageType::HelloSyn => {
-                info!("Handshake HELLO_SYN recibido del móvil. Respondiendo HELLO_ACK...");
-                let pc_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "NFC Bridge PC".to_string());
-                let payload = format!(r#"{{"pc_name":"{}","status":"ready"}}"#, pc_name);
-                let ack_frame = NfcBridgeFrame::new(
-                    MessageType::HelloAck,
-                    frame.sequence_id,
-                    payload.into_bytes(),
-                );
-                let _ = out_tx.send(ack_frame).await;
+                let pc_name = self.pairing.pc_name().to_string();
+                let outcome = self.pairing.validate_hello_payload(&frame.payload);
+                match outcome {
+                    HelloAuthOutcome::Rejected { reason } => {
+                        warn!("Handshake HELLO_SYN rechazado ({})", reason);
+                        let payload = serde_json::json!({
+                            "pc_name": pc_name,
+                            "status": "rejected",
+                            "reason": reason
+                        })
+                        .to_string();
+                        let ack_frame = NfcBridgeFrame::new(
+                            MessageType::HelloAck,
+                            frame.sequence_id,
+                            payload.into_bytes(),
+                        );
+                        let _ = out_tx.send(ack_frame).await;
+                        let notify = Arc::clone(&self.disconnect_notify);
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(80)).await;
+                            notify.notify_waiters();
+                        });
+                    }
+                    HelloAuthOutcome::Paired {
+                        device_name,
+                        new_device_token,
+                    } => {
+                        info!("Handshake HELLO_SYN emparejado con QR/Link (nuevo device_token emitido)");
+                        self.update_connected_device_name(device_name).await;
+                        let payload = serde_json::json!({
+                            "pc_name": pc_name,
+                            "status": "ready",
+                            "device_token": new_device_token
+                        })
+                        .to_string();
+                        let ack_frame = NfcBridgeFrame::new(
+                            MessageType::HelloAck,
+                            frame.sequence_id,
+                            payload.into_bytes(),
+                        );
+                        let _ = out_tx.send(ack_frame).await;
+                    }
+                    HelloAuthOutcome::Trusted { device_name }
+                    | HelloAuthOutcome::LegacyAllowed { device_name } => {
+                        info!("Handshake HELLO_SYN recibido del móvil. Respondiendo HELLO_ACK...");
+                        self.update_connected_device_name(device_name).await;
+                        let payload = serde_json::json!({
+                            "pc_name": pc_name,
+                            "status": "ready"
+                        })
+                        .to_string();
+                        let ack_frame = NfcBridgeFrame::new(
+                            MessageType::HelloAck,
+                            frame.sequence_id,
+                            payload.into_bytes(),
+                        );
+                        let _ = out_tx.send(ack_frame).await;
+                    }
+                }
             }
             MessageType::TagAttached => {
                 if self.is_paused.load(Ordering::Relaxed) {

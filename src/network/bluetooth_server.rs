@@ -13,6 +13,18 @@ pub struct BluetoothRfcommServer {
     coordinator: Arc<BridgeTcpServer>,
 }
 
+/// Devuelve `(MAC, Nombre)` del radio Bluetooth local en Windows si está disponible.
+pub fn get_local_bluetooth_info() -> Option<(String, String)> {
+    #[cfg(windows)]
+    {
+        windows_bt::query_local_radio_info()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 impl BluetoothRfcommServer {
     pub fn new(coordinator: Arc<BridgeTcpServer>) -> Self {
         Self { coordinator }
@@ -156,6 +168,36 @@ mod windows_bt {
         }
 
         Ok((radio_guard, radio_info.address.Anonymous.ullLong))
+    }
+
+    pub fn query_local_radio_info() -> Option<(String, String)> {
+        unsafe {
+            let params = BLUETOOTH_FIND_RADIO_PARAMS {
+                dwSize: size_of::<BLUETOOTH_FIND_RADIO_PARAMS>() as u32,
+            };
+            let mut raw_radio: HANDLE = null_mut();
+            let find_handle = BluetoothFindFirstRadio(&params, &mut raw_radio);
+            if find_handle.is_null() {
+                return None;
+            }
+            let _ = BluetoothFindRadioClose(find_handle);
+            let radio_guard = RadioHandleGuard(raw_radio);
+            let mut radio_info: BLUETOOTH_RADIO_INFO = zeroed();
+            radio_info.dwSize = size_of::<BLUETOOTH_RADIO_INFO>() as u32;
+            if BluetoothGetRadioInfo(radio_guard.0, &mut radio_info) != ERROR_SUCCESS {
+                return None;
+            }
+            let end = radio_info
+                .szName
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(radio_info.szName.len());
+            let name = String::from_utf16_lossy(&radio_info.szName[..end])
+                .trim()
+                .to_string();
+            let mac = format_bt_mac(radio_info.address.Anonymous.ullLong);
+            Some((mac, name))
+        }
     }
 
     /// Verifica que el radio Bluetooth siga activo y no haya sufrido un reinicio de pila (p. ej. BTHUSB).

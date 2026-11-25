@@ -7,13 +7,18 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use super::events::{IpcCommand, IpcEvent};
-use crate::network::{BridgeTcpServer, WifiDirectServer};
-use crate::protocol::constants::NAMED_PIPE_NAME;
+use crate::network::pairing_manager::detect_lan_ipv4;
+use crate::network::{
+    get_local_bluetooth_info, BridgeTcpServer, PairingManager, RelayClient, WifiDirectServer,
+};
+use crate::protocol::constants::{DEFAULT_TCP_PORT, NAMED_PIPE_NAME};
 
 pub struct NamedPipeIpcServer {
     event_sender: broadcast::Sender<IpcEvent>,
     coordinator: Option<Arc<BridgeTcpServer>>,
     wifi_direct: Option<Arc<WifiDirectServer>>,
+    pairing: Option<Arc<PairingManager>>,
+    relay_client: Option<Arc<RelayClient>>,
 }
 
 #[cfg(windows)]
@@ -74,6 +79,8 @@ impl NamedPipeIpcServer {
             event_sender,
             coordinator: None,
             wifi_direct: None,
+            pairing: None,
+            relay_client: None,
         }
     }
 
@@ -85,6 +92,8 @@ impl NamedPipeIpcServer {
             event_sender,
             coordinator: Some(coordinator),
             wifi_direct: None,
+            pairing: None,
+            relay_client: None,
         }
     }
 
@@ -92,12 +101,46 @@ impl NamedPipeIpcServer {
         event_sender: broadcast::Sender<IpcEvent>,
         coordinator: Arc<BridgeTcpServer>,
         wifi_direct: Arc<WifiDirectServer>,
+        pairing: Arc<PairingManager>,
+        relay_client: Arc<RelayClient>,
     ) -> Self {
         Self {
             event_sender,
             coordinator: Some(coordinator),
             wifi_direct: Some(wifi_direct),
+            pairing: Some(pairing),
+            relay_client: Some(relay_client),
         }
+    }
+
+    fn build_transport_snapshot(&self) -> Option<IpcEvent> {
+        let pairing = self.pairing.as_ref()?;
+        let bt_info = get_local_bluetooth_info();
+        let wfd = self.wifi_direct.as_ref().map(|w| w.current_snapshot());
+        let tcp_ip = detect_lan_ipv4();
+        let relay_url = pairing.get_relay_url();
+        let relay_channel = pairing.get_relay_channel();
+        let relay_connected = self
+            .relay_client
+            .as_ref()
+            .map(|r| r.is_connected())
+            .unwrap_or(false);
+
+        Some(IpcEvent::TransportSnapshot {
+            pc_name: pairing.pc_name().to_string(),
+            tcp_ip,
+            tcp_port: DEFAULT_TCP_PORT,
+            bt_available: bt_info.is_some(),
+            bt_mac: bt_info.as_ref().map(|(m, _)| m.clone()),
+            bt_name: bt_info.map(|(_, n)| n),
+            relay_url,
+            relay_channel,
+            relay_connected,
+            wfd_available: wfd.as_ref().map(|w| w.available && w.active).unwrap_or(false),
+            wfd_ssid: wfd.as_ref().and_then(|w| w.ssid.clone()),
+            wfd_passphrase: wfd.as_ref().and_then(|w| w.passphrase.clone()),
+            wfd_ip: wfd.and_then(|w| w.ip),
+        })
     }
 
     /// Inicia el bucle que acepta clientes locales de Windows (Sync / Tools).
@@ -146,6 +189,12 @@ impl NamedPipeIpcServer {
                         let _ = writer.flush().await;
                     }
                 }
+                if let Some(snapshot) = this.build_transport_snapshot() {
+                    if let Ok(json) = serde_json::to_string(&snapshot) {
+                        let _ = writer.write_all(format!("{}\n", json).as_bytes()).await;
+                        let _ = writer.flush().await;
+                    }
+                }
 
                 loop {
                     tokio::select! {
@@ -174,6 +223,58 @@ impl NamedPipeIpcServer {
                                                     }
                                                 }
                                             }
+                                            IpcCommand::GetTransportSnapshot => {
+                                                if let Some(snapshot) = this.build_transport_snapshot() {
+                                                    if let Ok(json) = serde_json::to_string(&snapshot) {
+                                                        if writer.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
+                                                            break;
+                                                        }
+                                                        let _ = writer.flush().await;
+                                                    }
+                                                }
+                                            }
+                                            IpcCommand::IssuePairingToken { method } => {
+                                                if let Some(ref pairing) = this.pairing {
+                                                    let (pair_token, expires_in_secs) = pairing.issue_ephemeral_token();
+                                                    let bt_info = get_local_bluetooth_info();
+                                                    let wfd = this.wifi_direct.as_ref().map(|w| w.current_snapshot());
+                                                    let tcp_ip = detect_lan_ipv4();
+                                                    let (uri, share_link) = pairing.build_qr_and_link(
+                                                        &method,
+                                                        &pair_token,
+                                                        tcp_ip.as_deref(),
+                                                        DEFAULT_TCP_PORT,
+                                                        bt_info.as_ref().map(|(m, _)| m.as_str()),
+                                                        wfd.as_ref().and_then(|w| w.ssid.as_deref()),
+                                                        wfd.as_ref().and_then(|w| w.passphrase.as_deref()),
+                                                        wfd.as_ref().and_then(|w| w.ip.as_deref()),
+                                                    );
+                                                    let evt = IpcEvent::PairingTokenIssued {
+                                                        method,
+                                                        pair_token,
+                                                        expires_in_secs,
+                                                        uri,
+                                                        share_link,
+                                                    };
+                                                    if let Ok(json) = serde_json::to_string(&evt) {
+                                                        if writer.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
+                                                            break;
+                                                        }
+                                                        let _ = writer.flush().await;
+                                                    }
+                                                }
+                                            }
+                                            IpcCommand::SetRelayUrl { url } => {
+                                                if let Some(ref pairing) = this.pairing {
+                                                    pairing.set_relay_url(url);
+                                                }
+                                                if let Some(ref relay) = this.relay_client {
+                                                    relay.notify_config_changed();
+                                                }
+                                                if let Some(snapshot) = this.build_transport_snapshot() {
+                                                    let _ = this.event_sender.send(snapshot);
+                                                }
+                                            }
                                             other_cmd => {
                                                 if let Some(ref coord) = this.coordinator {
                                                     match other_cmd {
@@ -192,7 +293,11 @@ impl NamedPipeIpcServer {
                                                         IpcCommand::DisconnectDevice => {
                                                             coord.disconnect_active().await;
                                                         }
-                                                        IpcCommand::SetUsbPriority { .. } | IpcCommand::GetWifiDirectInfo => {}
+                                                        IpcCommand::SetUsbPriority { .. }
+                                                        | IpcCommand::GetWifiDirectInfo
+                                                        | IpcCommand::GetTransportSnapshot
+                                                        | IpcCommand::IssuePairingToken { .. }
+                                                        | IpcCommand::SetRelayUrl { .. } => {}
                                                     }
                                                 }
                                             }

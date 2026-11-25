@@ -14,7 +14,8 @@ use tracing_subscriber::EnvFilter;
 use nfc_bridge_driver::emulator::{CcidHandler, UsbIpServer, USBIP_DEFAULT_PORT};
 use nfc_bridge_driver::ipc::{IpcEvent, NamedPipeIpcServer};
 use nfc_bridge_driver::network::{
-    BluetoothRfcommServer, BridgeTcpServer, UsbAoaHost, WifiDirectServer,
+    BluetoothRfcommServer, BridgeTcpServer, PairingManager, RelayClient, UsbAoaHost,
+    WifiDirectServer,
 };
 
 fn run_hidden_command(program: &str, args: &[&str]) -> std::io::Result<std::process::ExitStatus> {
@@ -171,15 +172,27 @@ async fn run_driver(shutdown: Option<Arc<Notify>>, log_to_file: bool) -> anyhow:
     // Canal broadcast interno para eventos IPC (Sync / Tools Desktop)
     let (event_tx, _) = broadcast::channel::<IpcEvent>(128);
 
-    // 2. Instanciar coordinador de red/transporte (TCP + UDP Discovery + USB AOA)
-    let tcp_server = Arc::new(BridgeTcpServer::new(event_tx.clone(), Arc::clone(&ccid_handler)));
+    // 2. Instanciar coordinador de red/transporte + pairing efímero + Cloud Relay
+    let pc_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "NFC Bridge PC".to_string());
+    let pairing_mgr = Arc::new(PairingManager::new(pc_name));
+    let tcp_server = Arc::new(BridgeTcpServer::with_pairing(
+        event_tx.clone(),
+        Arc::clone(&ccid_handler),
+        Arc::clone(&pairing_mgr),
+    ));
     let wfd_server = Arc::new(WifiDirectServer::new(event_tx.clone()));
+    let relay_client = Arc::new(RelayClient::new(
+        Arc::clone(&tcp_server),
+        Arc::clone(&pairing_mgr),
+    ));
 
     // 3. Iniciar Servidor IPC (Named Pipe de Windows: \\.\pipe\nfc_bridge_driver)
     let ipc_server = Arc::new(NamedPipeIpcServer::with_transports(
         event_tx,
         Arc::clone(&tcp_server),
         Arc::clone(&wfd_server),
+        Arc::clone(&pairing_mgr),
+        Arc::clone(&relay_client),
     ));
     tokio::spawn(async move {
         ipc_server.run().await;
@@ -209,6 +222,12 @@ async fn run_driver(shutdown: Option<Arc<Notify>>, log_to_file: bool) -> anyhow:
     let wfd_server_for_run = Arc::clone(&wfd_server);
     tokio::spawn(async move {
         wfd_server_for_run.run().await;
+    });
+
+    // 8. Iniciar cliente WebSocket saliente para Cloud Relay (si hay URL configurada)
+    let relay_for_run = Arc::clone(&relay_client);
+    tokio::spawn(async move {
+        relay_for_run.run().await;
     });
 
     // 6. Iniciar Servidor USB/IP (Puerto 3240 para emulación USB CCID ACR122U)

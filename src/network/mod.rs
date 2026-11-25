@@ -1,9 +1,13 @@
 pub mod bluetooth_server;
+pub mod pairing_manager;
+pub mod relay_client;
 pub mod tcp_server;
 pub mod usb_aoa_host;
 pub mod wifi_direct_server;
 
-pub use bluetooth_server::BluetoothRfcommServer;
+pub use bluetooth_server::{get_local_bluetooth_info, BluetoothRfcommServer};
+pub use pairing_manager::PairingManager;
+pub use relay_client::RelayClient;
 pub use tcp_server::BridgeTcpServer;
 pub use usb_aoa_host::UsbAoaHost;
-pub use wifi_direct_server::WifiDirectServer;
+pub use wifi_direct_server::{WifiDirectRuntimeInfo, WifiDirectServer};
