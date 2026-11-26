@@ -89,6 +89,7 @@ fn emit_win32_driver_resources() {
     );
 
     let ico_path = out_dir.join("app.ico");
+    let uninst_ico_path = out_dir.join("uninstall_res.ico");
     let rc_path = out_dir.join("app.rc");
     let res_path = out_dir.join("app.res");
 
@@ -102,9 +103,19 @@ fn emit_win32_driver_resources() {
         return;
     }
 
+    let mut uninst_rc_line = String::new();
+    let custom_uninst_ico = Path::new("assets/icons/uninstall.ico");
+    if custom_uninst_ico.exists() {
+        if let Ok(u_bytes) = std::fs::read(custom_uninst_ico) {
+            if u_bytes.len() >= 22 && std::fs::write(&uninst_ico_path, u_bytes).is_ok() {
+                uninst_rc_line = "2 ICON \"uninstall_res.ico\"\n".to_string();
+            }
+        }
+    }
+
     let rc_content = format!(
         r#"1 ICON "app.ico"
-1 VERSIONINFO
+{uninst_rc_line}1 VERSIONINFO
 FILEVERSION {v0},{v1},{v2},0
 PRODUCTVERSION {v0},{v1},{v2},0
 FILEFLAGSMASK 0x3fL
