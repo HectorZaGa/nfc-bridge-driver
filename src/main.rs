@@ -445,7 +445,8 @@ async fn run_driver(shutdown: Option<Arc<Notify>>, log_to_file: bool) -> anyhow:
         tokio::signal::ctrl_c().await?;
     }
 
-    info!("Señal de apagado recibida. Cerrando NFC Bridge Driver...");
+    info!("Señal de apagado recibida. Desconectando móvil activo y cerrando NFC Bridge Driver...");
+    tcp_server.disconnect_active().await;
     Ok(())
 }
 
