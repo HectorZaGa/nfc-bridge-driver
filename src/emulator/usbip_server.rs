@@ -227,6 +227,7 @@ impl UsbIpServer {
         // Cola de respuestas CCID pendientes listas para ser leídas por Bulk-IN (EP 2)
         let mut pending_bulk_in_responses: VecDeque<Vec<u8>> = VecDeque::new();
         let mut current_config = 1u8;
+        let mut last_reported_tag_present: Option<bool> = None;
 
         loop {
             let mut header_buf = [0u8; 48];
@@ -295,15 +296,13 @@ impl UsbIpServer {
                             }
                         }
                         3 => {
-                            // Endpoint 3: Interrupt-IN (Notificación de estado de ranura/tarjeta)
+                            // Endpoint 3: Interrupt-IN (RDR_to_PC_NotifySlotChange)
                             let handler = ccid_handler.lock().await;
-                            let slot_status = if handler.is_tag_present() {
-                                0x03 // Tarjeta presente y con cambio de estado
-                            } else {
-                                0x00 // No hay tarjeta
-                            };
-                            let notify = vec![0x50, slot_status];
-                            (0, notify)
+                            let present = handler.is_tag_present();
+                            let changed = last_reported_tag_present != Some(present);
+                            last_reported_tag_present = Some(present);
+                            let notify = handler.build_interrupt_message(changed);
+                            (0, notify.to_vec())
                         }
                         _ => {
                             warn!("URB en Endpoint desconocido: {}", ep);
@@ -414,9 +413,21 @@ impl UsbIpServer {
                 }
             }
             1 => {
-                // CCID Class-Specific Requests en EP 0 (ABORT, GET_CLOCK_FREQUENCIES, etc.)
-                debug!("CCID Class Request en EP0: bRequest=0x{:02X}", b_request);
-                (0, Vec::new())
+                // CCID Class-Specific Requests en EP 0:
+                // 0x01 = ABORT, 0x02 = GET_CLOCK_FREQUENCIES (4000 kHz), 0x03 = GET_DATA_RATES (19200 bps)
+                debug!("CCID Class Request en EP0: bRequest=0x{:02X}, len={}", b_request, w_length);
+                match b_request {
+                    0x01 => (0, Vec::new()),
+                    0x02 => {
+                        let data = [0xA0u8, 0x0F, 0x00, 0x00]; // 4000 kHz LE
+                        (0, data[..data.len().min(w_length)].to_vec())
+                    }
+                    0x03 => {
+                        let data = [0x00u8, 0x4B, 0x00, 0x00]; // 19200 bps LE
+                        (0, data[..data.len().min(w_length)].to_vec())
+                    }
+                    _ => (0, Vec::new()),
+                }
             }
             _ => {
                 (0, Vec::new())

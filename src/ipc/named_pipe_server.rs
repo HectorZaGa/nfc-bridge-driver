@@ -137,6 +137,11 @@ impl NamedPipeIpcServer {
         let tcp_port = pairing.get_tcp_port();
         let tcp_ip_override = pairing.get_tcp_ip_override();
         let auto_accept_mobile_switch = pairing.get_auto_accept_mobile_switch();
+        let read_only_mode = self
+            .coordinator
+            .as_ref()
+            .map(|c| c.is_read_only_mode())
+            .unwrap_or_else(|| pairing.get_read_only_mode());
         let relay_url = pairing.get_relay_url();
         let relay_channel = pairing.get_relay_channel();
         let relay_connected = self
@@ -199,6 +204,7 @@ impl NamedPipeIpcServer {
             driver_build_id: Some(env!("NFC_BRIDGE_BUILD_ID").to_string()),
             tcp_ip_override,
             auto_accept_mobile_switch,
+            read_only_mode,
             trusted_devices: pairing.list_trusted_devices(),
             network_online: has_outbound_network(),
         })
@@ -733,6 +739,16 @@ impl NamedPipeIpcServer {
                                                     let _ = this.event_sender.send(snapshot);
                                                 }
                                             }
+                                            IpcCommand::SetReadOnly { enabled } => {
+                                                if let Some(ref coord) = this.coordinator {
+                                                    coord.set_read_only_mode(enabled).await;
+                                                } else if let Some(ref pairing) = this.pairing {
+                                                    pairing.set_read_only_mode(enabled);
+                                                }
+                                                if let Some(snapshot) = this.build_transport_snapshot() {
+                                                    let _ = this.event_sender.send(snapshot);
+                                                }
+                                            }
                                             IpcCommand::RespondMobileSwitch {
                                                 request_id,
                                                 accept,
@@ -776,6 +792,7 @@ impl NamedPipeIpcServer {
                                                         | IpcCommand::SelectTrustedDevice { .. }
                                                         | IpcCommand::SetTcpNetworkConfig { .. }
                                                         | IpcCommand::SetAutoAcceptMobileSwitch { .. }
+                                                        | IpcCommand::SetReadOnly { .. }
                                                         | IpcCommand::RespondMobileSwitch { .. } => {}
                                                     }
                                                 }

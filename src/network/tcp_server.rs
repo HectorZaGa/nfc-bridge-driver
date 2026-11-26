@@ -14,6 +14,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
+use crate::emulator::ccid_handler::is_write_apdu;
 use crate::emulator::CcidHandler;
 use crate::ipc::events::IpcEvent;
 use crate::network::pairing_manager::{
@@ -24,7 +25,7 @@ use crate::protocol::codec::{FrameCodec, StreamFrameDecoder};
 use crate::protocol::constants::DEFAULT_TCP_PORT;
 use crate::protocol::crc::compute_crc16;
 use crate::protocol::frame::NfcBridgeFrame;
-use crate::protocol::message_type::MessageType;
+use crate::protocol::message_type::{MessageType, TransceiveStatus};
 
 #[derive(Debug, Clone, Default)]
 pub struct DriverRuntimeStatus {
@@ -38,8 +39,10 @@ pub struct DriverRuntimeStatus {
     pub last_active_device_id: Option<(String, Instant)>,
     pub latency_ms: u64,
     pub paused: bool,
+    pub pause_reason: Option<String>,
     pub tag_present: bool,
     pub tag_uid: Option<String>,
+    pub tag_technologies: Vec<String>,
 }
 
 pub struct BridgeTcpServer {
@@ -51,6 +54,7 @@ pub struct BridgeTcpServer {
     pending_transceive: Arc<Mutex<Option<(u16, oneshot::Sender<Vec<u8>>)>>>,
     runtime_status: Arc<Mutex<DriverRuntimeStatus>>,
     is_paused: AtomicBool,
+    read_only_mode: AtomicBool,
     disconnect_notify: Arc<Notify>,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     tcp_enabled: Arc<AtomicBool>,
@@ -84,6 +88,10 @@ impl BridgeTcpServer {
                 None
             }
         };
+        let initial_ro = pairing.get_read_only_mode();
+        if let Ok(mut handler) = ccid_handler.try_lock() {
+            handler.set_read_only(initial_ro);
+        }
         Self {
             event_tx,
             ccid_handler,
@@ -93,6 +101,7 @@ impl BridgeTcpServer {
             pending_transceive: Arc::new(Mutex::new(None)),
             runtime_status: Arc::new(Mutex::new(DriverRuntimeStatus::default())),
             is_paused: AtomicBool::new(false),
+            read_only_mode: AtomicBool::new(initial_ro),
             disconnect_notify: Arc::new(Notify::new()),
             tls_acceptor,
             tcp_enabled: Arc::new(AtomicBool::new(true)),
@@ -363,8 +372,11 @@ impl BridgeTcpServer {
             device_name: st.device_name.clone(),
             latency_ms: st.latency_ms,
             paused: self.is_paused.load(Ordering::Relaxed),
+            pause_reason: st.pause_reason.clone(),
             tag_present: st.tag_present,
             tag_uid: st.tag_uid.clone(),
+            tag_technologies: st.tag_technologies.clone(),
+            read_only_mode: self.read_only_mode.load(Ordering::Relaxed),
             transport: st.transport.clone(),
             mobile_id: st.mobile_id.clone(),
             device_os: st.device_os.clone(),
@@ -372,14 +384,39 @@ impl BridgeTcpServer {
         }
     }
 
-    async fn apply_pause_state(&self, paused: bool) {
+    pub fn is_read_only_mode(&self) -> bool {
+        self.read_only_mode.load(Ordering::Relaxed)
+    }
+
+    pub async fn set_read_only_mode(&self, enabled: bool) {
+        self.read_only_mode.store(enabled, Ordering::Relaxed);
+        self.pairing.set_read_only_mode(enabled);
+        {
+            let mut handler = self.ccid_handler.lock().await;
+            handler.set_read_only(enabled);
+        }
+        let status_evt = self.get_status_event().await;
+        let _ = self.event_tx.send(status_evt);
+    }
+
+    async fn apply_pause_state(&self, paused: bool, reason: Option<String>) {
         self.is_paused.store(paused, Ordering::Relaxed);
         {
             let mut st = self.runtime_status.lock().await;
             st.paused = paused;
+            st.pause_reason = if paused {
+                Some(
+                    reason
+                        .filter(|r| !r.trim().is_empty() && !r.eq_ignore_ascii_case("none"))
+                        .unwrap_or_else(|| "manual".to_string()),
+                )
+            } else {
+                None
+            };
             if paused {
                 st.tag_present = false;
                 st.tag_uid = None;
+                st.tag_technologies.clear();
             }
         }
         if paused {
@@ -391,14 +428,16 @@ impl BridgeTcpServer {
     }
 
     pub async fn set_paused(&self, paused: bool) {
-        self.apply_pause_state(paused).await;
+        let reason_str = if paused { "manual" } else { "none" };
+        self.apply_pause_state(paused, if paused { Some("manual".to_string()) } else { None })
+            .await;
         let client_tx = {
             let guard = self.active_client_tx.lock().await;
             guard.clone()
         };
         if let Some(tx) = client_tx {
             let seq = self.sequence_counter.fetch_add(1, Ordering::SeqCst);
-            let payload = serde_json::json!({ "paused": paused }).to_string();
+            let payload = serde_json::json!({ "paused": paused, "reason": reason_str }).to_string();
             let frame = NfcBridgeFrame::new(MessageType::DeviceState, seq, payload.into_bytes());
             let _ = tx.send(frame).await;
         }
@@ -612,6 +651,10 @@ impl BridgeTcpServer {
         if self.is_paused.load(Ordering::Relaxed) {
             return None;
         }
+        if self.read_only_mode.load(Ordering::Relaxed) && is_write_apdu(&payload) {
+            warn!("Escritura APDU bloqueada por política Solo Lectura en el driver");
+            return Some(vec![0x69, 0x82]);
+        }
 
         let client_tx = {
             let guard = self.active_client_tx.lock().await;
@@ -626,7 +669,8 @@ impl BridgeTcpServer {
             *pending = Some((seq, resp_tx));
         }
 
-        let frame = NfcBridgeFrame::new(MessageType::TransceiveReq, seq, payload);
+        let wire_payload = FrameCodec::encode_transceive_req(1500, &payload);
+        let frame = NfcBridgeFrame::new(MessageType::TransceiveReq, seq, wire_payload);
         if let Err(e) = client_tx.send(frame).await {
             warn!("Fallo al encolar TRANSCEIVE_REQ para el móvil: {}", e);
             let mut pending = self.pending_transceive.lock().await;
@@ -635,7 +679,17 @@ impl BridgeTcpServer {
         }
 
         match tokio::time::timeout(Duration::from_secs(2), resp_rx).await {
-            Ok(Ok(response_bytes)) => Some(response_bytes),
+            Ok(Ok(response_bytes)) => {
+                if let Some((status, data)) = FrameCodec::decode_transceive_resp(&response_bytes) {
+                    if status == TransceiveStatus::Success || !data.is_empty() {
+                        Some(data)
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(response_bytes)
+                }
+            }
             Ok(Err(_)) => {
                 debug!("Canal oneshot cancelado antes de recibir respuesta");
                 None
@@ -806,8 +860,10 @@ impl BridgeTcpServer {
                 st.device_os = None;
                 st.active_device_id = None;
                 st.paused = false;
+                st.pause_reason = None;
                 st.tag_present = false;
                 st.tag_uid = None;
+                st.tag_technologies.clear();
             }
             {
                 let mut handler = self.ccid_handler.lock().await;
@@ -995,8 +1051,14 @@ impl BridgeTcpServer {
                         "NTAG / Ultralight (ISO 14443-3A)"
                     } else if tag.is_iso_dep() {
                         "ISO-DEP / Tarjeta inteligente (ISO 14443-4)"
-                    } else if tag.sak == 0x08 || tag.sak == 0x18 {
+                    } else if tag.is_mifare_classic() || tag.sak == 0x08 || tag.sak == 0x18 {
                         "MIFARE Classic (ISO 14443-3A)"
+                    } else if tag.is_nfc_b() {
+                        "ISO 14443-3B (NfcB)"
+                    } else if tag.is_nfc_f() {
+                        "FeliCa (JIS X 6319-4 / NfcF)"
+                    } else if tag.is_nfc_v() {
+                        "ISO 15693 (Vicinity / NfcV)"
                     } else if tag.is_nfc_a() {
                         "ISO 14443-3A (NfcA)"
                     } else {
@@ -1004,20 +1066,25 @@ impl BridgeTcpServer {
                     };
                     info!("Etiqueta NFC detectada: {}", tag_type);
 
+                    let mut techs = Vec::new();
+                    if tag.is_nfc_a() { techs.push("NfcA".to_string()); }
+                    if tag.is_nfc_b() { techs.push("NfcB".to_string()); }
+                    if tag.is_iso_dep() { techs.push("IsoDep".to_string()); }
+                    if tag.is_nfc_f() { techs.push("NfcF".to_string()); }
+                    if tag.is_nfc_v() { techs.push("NfcV".to_string()); }
+                    if tag.is_mifare_classic() { techs.push("MifareClassic".to_string()); }
+                    if tag.is_mifare_ultralight() { techs.push("MifareUltralight".to_string()); }
+
                     {
                         let mut st = self.runtime_status.lock().await;
                         st.tag_present = true;
                         st.tag_uid = Some(uid_hex.clone());
+                        st.tag_technologies = techs.clone();
                     }
                     {
                         let mut handler = self.ccid_handler.lock().await;
                         handler.set_tag(Some(tag.clone()));
                     }
-
-                    let mut techs = Vec::new();
-                    if tag.is_nfc_a() { techs.push("NfcA".to_string()); }
-                    if tag.is_iso_dep() { techs.push("IsoDep".to_string()); }
-                    if tag.is_mifare_ultralight() { techs.push("MifareUltralight".to_string()); }
 
                     let _ = self.event_tx.send(IpcEvent::TagAttached {
                         uid: uid_hex,
@@ -1036,6 +1103,7 @@ impl BridgeTcpServer {
                     let mut st = self.runtime_status.lock().await;
                     st.tag_present = false;
                     st.tag_uid = None;
+                    st.tag_technologies.clear();
                 }
                 {
                     let mut handler = self.ccid_handler.lock().await;
@@ -1069,9 +1137,12 @@ impl BridgeTcpServer {
                 if !authenticated {
                     return false;
                 }
-                if let Some(remote_paused) = parse_device_state_paused(&frame.payload) {
-                    info!("Estado de pausa recibido desde el móvil: paused={}", remote_paused);
-                    self.apply_pause_state(remote_paused).await;
+                if let Some((remote_paused, reason)) = parse_device_state(&frame.payload) {
+                    info!(
+                        "Estado de pausa recibido desde el móvil: paused={} reason={:?}",
+                        remote_paused, reason
+                    );
+                    self.apply_pause_state(remote_paused, reason).await;
                 }
                 false
             }
@@ -1171,7 +1242,15 @@ impl BridgeTcpServer {
             st.active_device_id = active_device_id.clone();
             st.last_active_device_id = active_device_id.map(|id| (id, Instant::now()));
         }
-        self.apply_pause_state(phone_paused).await;
+        self.apply_pause_state(
+            phone_paused,
+            if phone_paused {
+                Some("manual".to_string())
+            } else {
+                None
+            },
+        )
+        .await;
         let _ = self.event_tx.send(IpcEvent::DeviceConnected {
             device_name: name,
             endpoint: peer_endpoint.to_string(),
@@ -1236,15 +1315,27 @@ fn is_wfd_endpoint_str(endpoint: &str, wfd_host_ip: &StdMutex<Option<String>>) -
     false
 }
 
-fn parse_device_state_paused(payload: &[u8]) -> Option<bool> {
+fn parse_device_state(payload: &[u8]) -> Option<(bool, Option<String>)> {
     if payload.len() == 1 && (payload[0] == 0 || payload[0] == 1) {
-        return Some(payload[0] == 1);
+        let p = payload[0] == 1;
+        return Some((p, if p { Some("manual".to_string()) } else { None }));
     }
     #[derive(serde::Deserialize)]
     struct DeviceStateJson {
         paused: Option<bool>,
+        #[serde(default)]
+        reason: Option<String>,
     }
-    serde_json::from_slice::<DeviceStateJson>(payload)
-        .ok()
-        .and_then(|s| s.paused)
+    let parsed = serde_json::from_slice::<DeviceStateJson>(payload).ok()?;
+    let paused = parsed.paused?;
+    let reason = if paused {
+        parsed
+            .reason
+            .map(|r| r.trim().to_ascii_lowercase())
+            .filter(|r| !r.is_empty() && r != "none")
+            .or_else(|| Some("manual".to_string()))
+    } else {
+        None
+    };
+    Some((paused, reason))
 }

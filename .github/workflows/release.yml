@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Driver version (e.g. 1.1.0)'
-        required: true
-        default: '1.1.0'
+        description: 'Driver version override (defaults to Cargo.toml version)'
+        required: false
+        default: ''
   push:
     tags:
       - 'v*'
@@ -23,59 +23,116 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc,i686-pc-windows-msvc,aarch64-pc-windows-msvc
 
+      - name: Ensure LLVM clang (for ARM64 ring) and Inno Setup 6
+        shell: pwsh
+        run: |
+          if (-not (Get-Command clang.exe -ErrorAction SilentlyContinue)) {
+            if (Test-Path "C:\Program Files\LLVM\bin\clang.exe") {
+              "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            } else {
+              choco install llvm -y --no-progress
+              "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            }
+          }
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+          "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Determine Version
         id: ver
         shell: pwsh
         run: |
+          $cargoToml = Get-Content "Cargo.toml" -Raw
+          $cargoVer = ([regex]::Match($cargoToml, '(?m)^version\s*=\s*"([^"]+)"')).Groups[1].Value
           if ("${{ github.ref }}" -like "refs/tags/v*") {
-            $v = "${{ github.ref_name }}".TrimStart('v')
+            $v = ("${{ github.ref_name }}".TrimStart('v') -split '-')[0]
+          } elseif ("${{ github.event.inputs.version }}".Trim()) {
+            $v = "${{ github.event.inputs.version }}".Trim()
           } else {
-            $v = "${{ github.event.inputs.version }}"
-            if (-not $v) { $v = "1.1.0" }
+            $v = $cargoVer
           }
           echo "version=$v" >> $env:GITHUB_OUTPUT
 
-      - name: Build x64, x86, ARM64 Driver binaries
+      - name: Run Driver Unit & Integration Tests
+        shell: pwsh
+        run: cargo test
+
+      - name: Build x64, x86, ARM64 Driver binaries & Inno Installers
         shell: pwsh
         run: |
           $Version = "${{ steps.ver.outputs.version }}"
-          $DistDir = "dist"
-          New-Item -ItemType Directory -Path $DistDir -Force | Out-Null
+          $Root = (Get-Location).Path
+          $OutDir = Join-Path $Root "target\packages"
+          New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
-          function Add-Sha256($path) {
-            $hash = (Get-FileHash -Path $path -Algorithm SHA256).Hash.ToLower()
-            $name = Split-Path -Leaf $path
-            [System.IO.File]::WriteAllText("$path.sha256", "$hash *$name`n")
-            return "$hash *$name"
+          $IssPath = Join-Path $Root "packaging\nfc-bridge.iss"
+          $SetupIcon = Join-Path $Root "assets\icons\setup.ico"
+          $UninstallIcon = Join-Path $Root "assets\icons\uninstall.ico"
+          $Iscc = (Get-Command ISCC.exe).Source
+
+          $Targets = @(
+            @{ Arch = "x64";   Triple = "x86_64-pc-windows-msvc" },
+            @{ Arch = "x86";   Triple = "i686-pc-windows-msvc" },
+            @{ Arch = "arm64"; Triple = "aarch64-pc-windows-msvc" }
+          )
+
+          $Payloads = @{}
+          foreach ($t in $Targets) {
+            cargo build --release --target $t.Triple --bin nfc-bridge-driver
+            if ($LASTEXITCODE -ne 0) { throw "Failed building driver for $($t.Triple)" }
+            $exe = Join-Path $Root "target\$($t.Triple)\release\nfc-bridge-driver.exe"
+            $Payloads[$t.Arch] = $exe
+
+            & $Iscc "/Q" `
+              "/DProductSlug=driver" `
+              "/DAppVersion=$Version" `
+              "/DArch=$($t.Arch)" `
+              "/DUniversalMode=0" `
+              "/DPayloadExe=$exe" `
+              "/DSetupIcon=$SetupIcon" `
+              "/DUninstallIcon=$UninstallIcon" `
+              "/DOutputDir=$OutDir" `
+              "/DOutputBaseFilename=nfc-bridge-driver-$Version-windows-$($t.Arch)-setup" `
+              $IssPath
+            if ($LASTEXITCODE -ne 0) { throw "Failed ISCC for $($t.Arch)" }
           }
 
-          $sums = @()
+          # Universal Setup (x64 / x86 / ARM64)
+          & $Iscc "/Q" `
+            "/DProductSlug=driver" `
+            "/DAppVersion=$Version" `
+            "/DUniversalMode=1" `
+            "/DPayloadExeX64=$($Payloads['x64'])" `
+            "/DPayloadExeX86=$($Payloads['x86'])" `
+            "/DPayloadExeArm64=$($Payloads['arm64'])" `
+            "/DSetupIcon=$SetupIcon" `
+            "/DUninstallIcon=$UninstallIcon" `
+            "/DOutputDir=$OutDir" `
+            "/DOutputBaseFilename=nfc-bridge-driver-$Version-windows-setup" `
+            $IssPath
+          if ($LASTEXITCODE -ne 0) { throw "Failed Universal ISCC build" }
 
-          # 1. x64
-          cargo build --release --target x86_64-pc-windows-msvc
-          Copy-Item "target\x86_64-pc-windows-msvc\release\nfc-bridge-driver.exe" "$DistDir\nfc-bridge-driver-$Version-x64.exe" -Force
-          $sums += Add-Sha256 "$DistDir\nfc-bridge-driver-$Version-x64.exe"
+          $sums = Get-ChildItem -Path $OutDir -File | Where-Object { $_.Name -ne "SHA256SUMS.txt" } | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          }
+          [System.IO.File]::WriteAllLines((Join-Path $OutDir "SHA256SUMS.txt"), $sums, [System.Text.UTF8Encoding]::new($false))
 
-          # 2. x86 (32-bit)
-          cargo build --release --target i686-pc-windows-msvc
-          Copy-Item "target\i686-pc-windows-msvc\release\nfc-bridge-driver.exe" "$DistDir\nfc-bridge-driver-$Version-x86.exe" -Force
-          $sums += Add-Sha256 "$DistDir\nfc-bridge-driver-$Version-x86.exe"
-
-          # 3. ARM64
-          cargo build --release --target aarch64-pc-windows-msvc
-          Copy-Item "target\aarch64-pc-windows-msvc\release\nfc-bridge-driver.exe" "$DistDir\nfc-bridge-driver-$Version-arm64.exe" -Force
-          $sums += Add-Sha256 "$DistDir\nfc-bridge-driver-$Version-arm64.exe"
-
-          [System.IO.File]::WriteAllLines("$DistDir\SHA256SUMS.txt", $sums)
+      # Placeholder para firma con SignPath Foundation una vez aprobada la organización:
+      # Añadir submit-signing-request (signpath/github-action-submit-signing-request) con ${{ secrets.SIGNPATH_API_TOKEN }}.
 
       - name: Upload Driver Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: nfc-bridge-driver-${{ steps.ver.outputs.version }}
-          path: dist/*
+          path: target/packages/*
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: target/packages/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

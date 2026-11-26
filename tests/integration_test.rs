@@ -76,3 +76,40 @@ async fn test_ccid_usbip_transceive_dispatch() {
     assert_eq!(resp[0], 0x80); // RDR_to_PC_DataBlock
     assert_eq!(&resp[10..26], &[0xAA; 16]);
 }
+
+#[tokio::test]
+async fn test_ccid_read_only_blocks_writes() {
+    use nfc_bridge_driver::emulator::CcidHandler;
+    use nfc_bridge_driver::ipc::IpcCommand;
+
+    let cmd: IpcCommand =
+        serde_json::from_str(r#"{"command":"SetReadOnly","params":{"enabled":true}}"#)
+            .expect("Debe deserializar IpcCommand::SetReadOnly");
+    match cmd {
+        IpcCommand::SetReadOnly { enabled } => assert!(enabled),
+        _ => panic!("Comando inesperado"),
+    }
+
+    let mut handler = CcidHandler::new();
+    handler.set_tag(Some(TagInfo {
+        uid: vec![0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+        technology_mask: 1 | (1 << 6),
+        atqa: 0x0044,
+        sak: 0x00,
+        historical_bytes: vec![],
+    }));
+    handler.set_read_only(true);
+    assert!(handler.is_read_only());
+
+    // Pseudo-APDU FF D6 00 04 04 ... (escritura Mifare Ultralight) debe retornar 69 82 sin llamar al teléfono
+    let write_apdu = vec![
+        0x6F, 0x09, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00,
+        0xFF, 0xD6, 0x00, 0x04, 0x04, 0x01, 0x02, 0x03, 0x04,
+    ];
+    let resp = handler
+        .process_ccid_command(&write_apdu, |_| async move {
+            panic!("No debe reenviar escrituras cuando Solo Lectura está activo");
+        })
+        .await;
+    assert_eq!(&resp[10..12], &[0x69, 0x82]);
+}

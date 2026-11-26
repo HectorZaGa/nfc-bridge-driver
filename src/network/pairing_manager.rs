@@ -48,6 +48,8 @@ struct DriverSettingsFile {
     pub tcp_port: u16,
     #[serde(default)]
     pub auto_accept_mobile_switch: bool,
+    #[serde(default)]
+    pub read_only_mode: bool,
 }
 
 fn default_tcp_port_cfg() -> u16 {
@@ -60,6 +62,7 @@ impl Default for DriverSettingsFile {
             tcp_ip_override: None,
             tcp_port: default_tcp_port_cfg(),
             auto_accept_mobile_switch: false,
+            read_only_mode: false,
         }
     }
 }
@@ -212,6 +215,22 @@ impl PairingManager {
         let path = self.data_dir.join("driver_settings.json");
         if let Ok(mut st) = self.driver_settings.lock() {
             st.auto_accept_mobile_switch = enabled;
+            save_driver_settings(&path, &st);
+        }
+    }
+
+    pub fn get_read_only_mode(&self) -> bool {
+        self.driver_settings
+            .lock()
+            .ok()
+            .map(|s| s.read_only_mode)
+            .unwrap_or(false)
+    }
+
+    pub fn set_read_only_mode(&self, enabled: bool) {
+        let path = self.data_dir.join("driver_settings.json");
+        if let Ok(mut st) = self.driver_settings.lock() {
+            st.read_only_mode = enabled;
             save_driver_settings(&path, &st);
         }
     }

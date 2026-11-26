@@ -22,8 +22,24 @@ impl TagInfo {
         (self.technology_mask & (1 << 0)) != 0
     }
 
+    pub fn is_nfc_b(&self) -> bool {
+        (self.technology_mask & (1 << 1)) != 0
+    }
+
     pub fn is_iso_dep(&self) -> bool {
         (self.technology_mask & (1 << 2)) != 0
+    }
+
+    pub fn is_nfc_f(&self) -> bool {
+        (self.technology_mask & (1 << 3)) != 0
+    }
+
+    pub fn is_nfc_v(&self) -> bool {
+        (self.technology_mask & (1 << 4)) != 0
+    }
+
+    pub fn is_mifare_classic(&self) -> bool {
+        (self.technology_mask & (1 << 5)) != 0
     }
 
     pub fn is_mifare_ultralight(&self) -> bool {

@@ -31,6 +31,7 @@ pub enum IpcCommand {
     IssuePairingToken { method: String },
     SetRelayUrl { url: Option<String> },
     SetPaused { paused: bool },
+    SetReadOnly { enabled: bool },
     SetUsbPriority { enabled: bool },
     SetUsbEnabled { enabled: bool },
     SetTcpEnabled { enabled: bool },
@@ -58,8 +59,14 @@ pub enum IpcEvent {
         device_name: Option<String>,
         latency_ms: u64,
         paused: bool,
+        #[serde(default)]
+        pause_reason: Option<String>,
         tag_present: bool,
         tag_uid: Option<String>,
+        #[serde(default)]
+        tag_technologies: Vec<String>,
+        #[serde(default)]
+        read_only_mode: bool,
         #[serde(default)]
         transport: Option<String>,
         #[serde(default)]
@@ -113,6 +120,8 @@ pub enum IpcEvent {
         tcp_ip_override: Option<String>,
         #[serde(default)]
         auto_accept_mobile_switch: bool,
+        #[serde(default)]
+        read_only_mode: bool,
         #[serde(default)]
         trusted_devices: Vec<TrustedDeviceInfo>,
         #[serde(default = "default_true")]
