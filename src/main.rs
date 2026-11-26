@@ -367,9 +367,11 @@ async fn run_driver(shutdown: Option<Arc<Notify>>, log_to_file: bool) -> anyhow:
         Arc::clone(&pairing_mgr),
     ));
     let wfd_server = Arc::new(WifiDirectServer::new(event_tx.clone()));
-    let relay_client = Arc::new(RelayClient::new(
+    let snapshot_notify = Arc::new(tokio::sync::Notify::new());
+    let relay_client = Arc::new(RelayClient::with_snapshot_notify(
         Arc::clone(&tcp_server),
         Arc::clone(&pairing_mgr),
+        Arc::clone(&snapshot_notify),
     ));
     let aoa_host = Arc::new(UsbAoaHost::new(Arc::clone(&tcp_server)));
     let bt_server = Arc::new(BluetoothRfcommServer::new(Arc::clone(&tcp_server)));
@@ -383,6 +385,7 @@ async fn run_driver(shutdown: Option<Arc<Notify>>, log_to_file: bool) -> anyhow:
         Arc::clone(&relay_client),
         Arc::clone(&aoa_host),
         Arc::clone(&bt_server),
+        snapshot_notify,
     ));
     tokio::spawn(async move {
         ipc_server.run().await;

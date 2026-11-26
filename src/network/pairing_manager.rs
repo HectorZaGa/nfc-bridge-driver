@@ -798,6 +798,11 @@ impl PairingManager {
         wfd_ip: Option<&str>,
     ) -> (String, Option<String>) {
         let encoded_name = percent_encode_query(&self.pc_name);
+        let port_part = if tcp_port == 45362 {
+            String::new()
+        } else {
+            format!(":{}", tcp_port)
+        };
         match method {
             "wifi_direct" => {
                 let host = wfd_ip.unwrap_or("192.168.137.1");
@@ -805,12 +810,12 @@ impl PairingManager {
                 let pass = wfd_pass.unwrap_or("");
                 let cert_suffix = self
                     .get_tcp_cert_sha256()
-                    .map(|c| format!("&cert={}", percent_encode_query(&c)))
+                    .map(|c| format!("&cert={}", encode_cert_qr_param(&c)))
                     .unwrap_or_default();
                 let uri = format!(
-                    "nfcbridge://{}:{}?name={}&transport=wifi_direct&ssid={}&pass={}&pair={}{}",
+                    "nfcbridge://{}{}?name={}&transport=wifi_direct&ssid={}&pass={}&pair={}{}",
                     host,
-                    tcp_port,
+                    port_part,
                     encoded_name,
                     percent_encode_query(ssid),
                     percent_encode_query(pass),
@@ -849,12 +854,12 @@ impl PairingManager {
                 let ip = tcp_ip.unwrap_or("127.0.0.1");
                 let cert_suffix = self
                     .get_tcp_cert_sha256()
-                    .map(|c| format!("&cert={}", percent_encode_query(&c)))
+                    .map(|c| format!("&cert={}", encode_cert_qr_param(&c)))
                     .unwrap_or_default();
                 let uri = format!(
-                    "nfcbridge://{}:{}?name={}&transport=tcp&pair={}{}",
+                    "nfcbridge://{}{}?name={}&transport=tcp&pair={}{}",
                     ip,
-                    tcp_port,
+                    port_part,
                     encoded_name,
                     percent_encode_query(pair_token),
                     cert_suffix,
@@ -885,9 +890,50 @@ pub fn parse_hello_paused(payload: &[u8]) -> bool {
 }
 
 pub fn detect_lan_ipv4() -> Option<String> {
-    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
-    sock.connect("8.8.8.8:80").ok()?;
-    sock.local_addr().ok().map(|a| a.ip().to_string())
+    for target in ["8.8.8.8:80", "1.1.1.1:80"] {
+        if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+            if sock.connect(target).is_ok() {
+                if let Ok(addr) = sock.local_addr() {
+                    return Some(addr.ip().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn has_outbound_network() -> bool {
+    if detect_lan_ipv4().is_some() {
+        return true;
+    }
+    for target in ["[2001:4860:4860::8888]:80", "[2606:4700:4700::1111]:80"] {
+        if let Ok(sock) = UdpSocket::bind("[::]:0") {
+            if sock.connect(target).is_ok() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn encode_cert_qr_param(hex64: &str) -> String {
+    let trimmed = hex64.trim();
+    if trimmed.len() == 64 && trimmed.as_bytes().iter().all(|b| b.is_ascii_hexdigit()) {
+        let mut raw = [0u8; 32];
+        let mut ok = true;
+        for i in 0..32 {
+            if let Ok(v) = u8::from_str_radix(&trimmed[i * 2..i * 2 + 2], 16) {
+                raw[i] = v;
+            } else {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return base64url_encode_nopad(&raw);
+        }
+    }
+    percent_encode_query(trimmed)
 }
 
 pub fn to_ws_base(raw: &str) -> String {

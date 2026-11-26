@@ -3,10 +3,11 @@
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::ServerOptions;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 use tracing::{error, info, warn};
 
 use super::events::{IpcCommand, IpcEvent};
+use crate::network::pairing_manager::has_outbound_network;
 use crate::network::{
     get_local_bluetooth_info, BluetoothRfcommServer, BridgeTcpServer, PairingManager, RelayClient,
     UsbAoaHost, WifiDirectServer,
@@ -21,6 +22,7 @@ pub struct NamedPipeIpcServer {
     relay_client: Option<Arc<RelayClient>>,
     usb_aoa: Option<Arc<UsbAoaHost>>,
     bluetooth: Option<Arc<BluetoothRfcommServer>>,
+    snapshot_notify: Arc<Notify>,
 }
 
 #[cfg(windows)]
@@ -85,6 +87,7 @@ impl NamedPipeIpcServer {
             relay_client: None,
             usb_aoa: None,
             bluetooth: None,
+            snapshot_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -100,6 +103,7 @@ impl NamedPipeIpcServer {
             relay_client: None,
             usb_aoa: None,
             bluetooth: None,
+            snapshot_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -111,6 +115,7 @@ impl NamedPipeIpcServer {
         relay_client: Arc<RelayClient>,
         usb_aoa: Arc<UsbAoaHost>,
         bluetooth: Arc<BluetoothRfcommServer>,
+        snapshot_notify: Arc<Notify>,
     ) -> Self {
         Self {
             event_sender,
@@ -120,6 +125,7 @@ impl NamedPipeIpcServer {
             relay_client: Some(relay_client),
             usb_aoa: Some(usb_aoa),
             bluetooth: Some(bluetooth),
+            snapshot_notify,
         }
     }
 
@@ -194,6 +200,7 @@ impl NamedPipeIpcServer {
             tcp_ip_override,
             auto_accept_mobile_switch,
             trusted_devices: pairing.list_trusted_devices(),
+            network_online: has_outbound_network(),
         })
     }
 
@@ -250,6 +257,40 @@ impl NamedPipeIpcServer {
     /// Inicia el bucle que acepta clientes locales de Windows (Sync / Tools).
     pub async fn run(self: Arc<Self>) {
         info!("Iniciando servidor IPC Named Pipe en {}", NAMED_PIPE_NAME);
+
+        let watcher_this = Arc::clone(&self);
+        tokio::spawn(async move {
+            let mut last_state: Option<(Option<String>, bool, bool, bool, bool)> = None;
+            loop {
+                tokio::select! {
+                    _ = watcher_this.snapshot_notify.notified() => {}
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(450)) => {}
+                }
+                if let Some(snapshot) = watcher_this.build_transport_snapshot() {
+                    if let IpcEvent::TransportSnapshot {
+                        ref tcp_ip,
+                        bt_available,
+                        relay_connected,
+                        wfd_available,
+                        network_online,
+                        ..
+                    } = snapshot
+                    {
+                        let cur = (
+                            tcp_ip.clone(),
+                            bt_available,
+                            relay_connected,
+                            wfd_available,
+                            network_online,
+                        );
+                        if last_state.as_ref() != Some(&cur) {
+                            last_state = Some(cur);
+                            let _ = watcher_this.event_sender.send(snapshot);
+                        }
+                    }
+                }
+            }
+        });
 
         let mut first = true;
         loop {

@@ -115,6 +115,8 @@ pub enum IpcEvent {
         auto_accept_mobile_switch: bool,
         #[serde(default)]
         trusted_devices: Vec<TrustedDeviceInfo>,
+        #[serde(default = "default_true")]
+        network_online: bool,
     },
     PendingMobileSwitch {
         request_id: String,
