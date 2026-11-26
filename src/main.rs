@@ -223,6 +223,14 @@ fn handle_cli_commands() -> Option<anyhow::Result<()>> {
             match status {
                 Ok(s) if s.success() => {
                     configure_firewall_rules(true);
+                    let _ = run_hidden_command(
+                        "sc.exe",
+                        &[
+                            "sdset",
+                            "NfcBridgeDriver",
+                            "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPLOCRRC;;;AU)",
+                        ],
+                    );
                     let start_status = run_hidden_command("sc.exe", &["start", "NfcBridgeDriver"]);
                     match start_status {
                         Ok(st) if st.success() => Some(Ok(())),
