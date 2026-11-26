@@ -57,3 +57,20 @@ cargo run
 cargo build --release
 ```
 El ejecutable resultante se genera en `target/release/nfc-bridge-driver.exe`.
+
+---
+
+## 📄 Licencia
+
+Distribuido bajo la licencia **GNU General Public License v3.0 (`GPL-3.0-only`)**.  
+Copyright (c) 2026 Hector Zarate (`@HectorZaGa`). Consulta el archivo [LICENSE](LICENSE) para más detalles.
+
+---
+
+## 🔐 Code Signing Policy
+
+Free code signing provided by [SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+- **Committers & Approvers:** Hector Zarate (`@HectorZaGa`)
+- **Reviewers:** Repository maintainers (`@HectorZaGa`)
+- **Privacy Policy:** Signed binaries are built exclusively from public source code via GitHub Actions. This software does not transmit personal data or telemetry to external servers without explicit user action (such as checking GitHub Releases for updates or using user-configured Relay connections).

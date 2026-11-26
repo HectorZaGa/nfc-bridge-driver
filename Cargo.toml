@@ -3,6 +3,8 @@ name = "nfc-bridge-driver"
 version = "0.4.0"
 edition = "2021"
 authors = ["Hector Zarate <HectorZaGa96@hotmail.com>"]
+license = "GPL-3.0-only"
+repository = "https://github.com/HectorZaGa/nfc-bridge-driver"
 description = "Ultra-low latency NFC bridge background driver and PC/SC emulator for Windows"
 
 [dependencies]
