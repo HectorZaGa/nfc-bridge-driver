@@ -13,8 +13,8 @@ use crate::ipc::events::TrustedDeviceInfo;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::digest;
 
-const QR_PAIR_TTL_SECS: u64 = 30;
-const RELAY_LINK_TTL_SECS: u64 = 90;
+const QR_PAIR_TTL_SECS: u64 = 120;
+const RELAY_LINK_TTL_SECS: u64 = 120;
 const RELAY_ENVELOPE_DOMAIN: &[u8] = b"NFC-BRIDGE-RELAY-LINK-ENVELOPE-V1|v1|2026";
 const RELAY_ENVELOPE_AAD: &[u8] = b"nb-link-v1";
 
@@ -1400,9 +1400,9 @@ mod tests {
         let dir = temp_dir("pair_once");
         let mgr = PairingManager::with_data_dir(dir.clone(), "HECTOR-MASTER".to_string());
         let (pair_token, ttl) = mgr.issue_ephemeral_token();
-        assert_eq!(ttl, 30);
+        assert_eq!(ttl, QR_PAIR_TTL_SECS);
         let (_, link_ttl) = mgr.issue_ephemeral_token_for_method("relay_link");
-        assert_eq!(link_ttl, 90);
+        assert_eq!(link_ttl, RELAY_LINK_TTL_SECS);
 
         let syn1 = format!(r#"{{"device_name":"Morduuk","pair_token":"{}"}}"#, pair_token);
         let outcome1 = mgr.validate_hello_payload(syn1.as_bytes());
@@ -1582,6 +1582,7 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].device_os.as_deref(), Some("ios"));
         assert_eq!(listed[1].device_os.as_deref(), Some("android"));
+        assert_eq!(device_public_id("DEV-test123"), "dev-e3cadb8679a9");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

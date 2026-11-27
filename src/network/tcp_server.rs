@@ -1163,27 +1163,70 @@ impl BridgeTcpServer {
                         .and_then(|v| v.get("transport").and_then(|t| t.as_str()))
                         .map(str::to_string)
                         .or(tr);
-                    let target_info = req_tr.as_deref().and_then(|tr_name| {
-                        self.pairing.find_trusted_device_by_meta(
-                            mob_id.as_deref(),
-                            tr_name,
-                            Some(dev_name.as_str()),
-                        )
-                    });
-                    let _ = self.event_tx.send(IpcEvent::PairingInvalidNotice {
-                        device_id: target_info.as_ref().map(|d| d.device_id.clone()).or(dev_id),
-                        device_name: target_info
-                            .as_ref()
-                            .map(|d| d.device_name.clone())
-                            .unwrap_or(dev_name),
-                        mobile_id: mob_id,
-                        transport: req_tr,
-                        reason: "deleted_on_mobile".to_string(),
-                    });
-                    let is_active_revoked = parsed
+
+                    let mut requested_ids: Vec<String> = Vec::new();
+                    if let Some(arr) = parsed
                         .as_ref()
-                        .and_then(|v| v.get("active").and_then(|b| b.as_bool()))
-                        .unwrap_or(true);
+                        .and_then(|v| v.get("revoked_device_ids").and_then(|a| a.as_array()))
+                    {
+                        for item in arr {
+                            if let Some(s) = item.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                                if !requested_ids.iter().any(|existing| existing == s) {
+                                    requested_ids.push(s.to_string());
+                                }
+                            }
+                        }
+                    }
+                    if let Some(single) = parsed
+                        .as_ref()
+                        .and_then(|v| v.get("device_id").and_then(|s| s.as_str()))
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        if !requested_ids.iter().any(|existing| existing == single) {
+                            requested_ids.push(single.to_string());
+                        }
+                    }
+
+                    if !requested_ids.is_empty() {
+                        for req_id in &requested_ids {
+                            if let Some(info) = self.pairing.get_trusted_device(req_id) {
+                                let _ = self.event_tx.send(IpcEvent::PairingInvalidNotice {
+                                    device_id: Some(info.device_id),
+                                    device_name: info.device_name,
+                                    mobile_id: info.mobile_id.or_else(|| mob_id.clone()),
+                                    transport: info.transport.or_else(|| req_tr.clone()),
+                                    reason: "deleted_on_mobile".to_string(),
+                                });
+                            }
+                        }
+                    } else {
+                        let target_info = req_tr.as_deref().and_then(|tr_name| {
+                            self.pairing.find_trusted_device_by_meta(
+                                mob_id.as_deref(),
+                                tr_name,
+                                Some(dev_name.as_str()),
+                            )
+                        });
+                        let _ = self.event_tx.send(IpcEvent::PairingInvalidNotice {
+                            device_id: target_info.as_ref().map(|d| d.device_id.clone()).or_else(|| dev_id.clone()),
+                            device_name: target_info
+                                .as_ref()
+                                .map(|d| d.device_name.clone())
+                                .unwrap_or(dev_name),
+                            mobile_id: mob_id,
+                            transport: req_tr,
+                            reason: "deleted_on_mobile".to_string(),
+                        });
+                    }
+
+                    let explicit_active = parsed
+                        .as_ref()
+                        .and_then(|v| v.get("active").and_then(|b| b.as_bool()));
+                    let hits_active_id = dev_id
+                        .as_deref()
+                        .is_some_and(|aid| requested_ids.iter().any(|id| id == aid));
+                    let is_active_revoked = hits_active_id || explicit_active.unwrap_or(requested_ids.is_empty());
                     if is_active_revoked {
                         session_cancel.notify_waiters();
                     }
@@ -1255,10 +1298,17 @@ impl BridgeTcpServer {
             device_name: name,
             endpoint: peer_endpoint.to_string(),
         });
+        let trusted_device_ids: Vec<String> = self
+            .pairing
+            .list_trusted_devices()
+            .into_iter()
+            .map(|d| d.device_id)
+            .collect();
         let mut ack_obj = serde_json::json!({
             "pc_name": pc_name,
             "status": "ready",
-            "paused": phone_paused
+            "paused": phone_paused,
+            "trusted_device_ids": trusted_device_ids,
         });
         if let (Some(tok), Some(map)) = (new_device_token, ack_obj.as_object_mut()) {
             map.insert("device_token".to_string(), serde_json::Value::String(tok));

@@ -544,11 +544,18 @@ impl NamedPipeIpcServer {
                                                                     _ => false,
                                                                 };
                                                             if same_phone {
+                                                                let remaining_ids: Vec<String> = pairing
+                                                                    .list_trusted_devices()
+                                                                    .into_iter()
+                                                                    .map(|d| d.device_id)
+                                                                    .collect();
                                                                 let payload = serde_json::json!({
                                                                     "pc_name": pairing.pc_name(),
                                                                     "transport": removed_info.transport,
                                                                     "channel": pairing.get_relay_channel(),
                                                                     "endpoint": removed_info.endpoint,
+                                                                    "revoked_device_id": removed_info.device_id,
+                                                                    "remaining_device_ids": remaining_ids,
                                                                     "active": is_active,
                                                                 })
                                                                 .to_string();
